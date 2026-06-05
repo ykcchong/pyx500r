@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyx500r"
+version = "0.2.0"
+description = "Pure-Python reader for SCIEX X500R QTOF acquisitions and MultiQuant qsession result tables"
+readme = "README.md"
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Calvin Yeow-kuan Chong", email = "calvin@buu.hk"},
+]
+keywords = ["mass-spectrometry", "SCIEX", "X500R", "WIFF2", "qsession", "toxicology", "small-molecule", "metabolomics", "forensics"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# ── base install (numba JIT is required) ──
+dependencies = [
+    "cryptography>=41.0.0",
+    "numba>=0.58.0",
+    "numpy>=1.24.0",
+]
+
+# ── optional extras ──
+[project.optional-dependencies]
+# Backward-compatible alias (numba and numpy are now base dependencies)
+all = [
+    "numba>=0.58.0",
+    "numpy>=1.24.0",
+]
+
+# Development / testing
+dev = [
+    "pytest>=7.0",
+]
+
+
+
+[project.urls]
+Repository = "https://github.com/ykcchong/pyx500r"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
