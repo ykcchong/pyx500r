@@ -3,7 +3,7 @@
 SCIEX ``.wiff2`` and ``.timeseries.data`` files are SQLite databases encrypted
 with the SQLite Encryption Extension (SEE) using its **AES-128-OFB** cipher.
 
-The layout is:
+The scheme, fully reverse engineered, is:
 
 * Page size 4096 bytes, with 12 reserved bytes at the end of every page.
 * The 12 reserved bytes (page offset ``4084:4096``) hold a per-page random
@@ -16,8 +16,9 @@ The layout is:
   decrypting, bytes ``[0:16]`` are replaced with the ``"SQLite format 3\\x00"``
   magic and bytes ``[16:24]`` (page-size / reserved-size fields) are taken
   verbatim from the ciphertext.
-Only the third-party ``cryptography`` package is required for the AES
-primitive.
+
+No SCIEX or System.Data.SQLite DLLs are required - only the third-party
+``cryptography`` package for the AES primitive.
 """
 
 from __future__ import annotations
@@ -37,10 +38,11 @@ __all__ = [
     "decrypt_database",
 ]
 
-# Fixed password used for SCIEX wiff2 containers.
+# Password returned by Clearcore2.Data.Wiff2.PersistenceFactory.GetPassword().
+# Hardcoded/derivable and identical for every SCIEX wiff2 container.
 WIFF2_PASSWORD = "F90CA3B4-CC7B-4439-A479-2097CB8AE246"
 
-# Fixed password used for SCIEX qsession containers.
+# Password returned by Sciex.MultiQuant.Data.Utility.DBHelper.GetConnectionString().
 QSESSION_PASSWORD = "PQS1 is not Sirius"
 
 PAGE_SIZE = 4096

@@ -1,11 +1,15 @@
-"""Pure-Python SCIEX X500R QTOF TOF spectrum codec.
+"""Pure-Python SCIEX TOF spectrum codec.
 
-An X500R acquisition stores each TOF spectrum as a compressed run-length stream
+Reverse-engineered, byte-exact reimplementation of
+``Clearcore2.Compression.DecompressionAlgorithmTof`` and
+``Sciex.FMan.DefaultTofCalibration`` with **no .NET / DLL dependency**.
+
+A WIFF2 acquisition stores each TOF spectrum as a compressed run-length stream
 of (time-bin, intensity) pairs inside the companion ``.wiff.scan`` file. The
 m/z axis is recovered from a per-scan quadratic calibration.
 
-Performance-critical paths are JIT-compiled with **numba** for near-C speed.
-Legacy pure-Python code is retained for reference but is no longer used at runtime.
+Performance-critical paths are JIT-compiled with **numba** (when available) for
+near-C speed. A pure-Python fallback is always available.
 """
 
 from __future__ import annotations
@@ -13,10 +17,20 @@ from __future__ import annotations
 import struct
 from math import sqrt
 
-from numba import njit
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+    # no-op decorator when numba is absent
+    def njit(*args, **kwargs):  # noqa: F811
+        def _identity(fn):
+            return fn
+        return _identity
 
 
-# TOF decompression control constants.
+# DecompressionAlgorithmTof control constants (decompiled).
 _IS_ZEROS_MASK = 0x80
 _ONE_BYTE_VAL = 124
 _TWO_BYTE_VAL = 125
@@ -74,13 +88,16 @@ def _decode_loop(
 
 
 # --------------------------------------------------------------------------- #
-# Numba JIT kernels
+# Numba JIT kernels (conditionally compiled)
 # --------------------------------------------------------------------------- #
-@njit(cache=True)
-def _decompress_tof_kernel_fast(
-    stream, pos_start, start_bin, step, min_bin,
-    bins_out, ints_out, max_out,
-) -> int:
+if _HAS_NUMBA:
+    import numpy as np  # numba always pulls in numpy
+
+    @njit(cache=True)
+    def _decompress_tof_kernel_fast(
+        stream, pos_start, start_bin, step, min_bin,
+        bins_out, ints_out, max_out,
+    ) -> int:
         """Core JIT loop — returns the number of written points."""
         pos = pos_start
         time_bin = start_bin
@@ -112,12 +129,12 @@ def _decompress_tof_kernel_fast(
                 time_bin += step
         return count
 
-@njit(cache=True)
-def _decompress_tof_kernel_calibrated(
-    stream, cal_a, cal_t0, time_resolution,
-    pos_start, start_bin, step, min_bin,
-    mz_out, ints_out, max_out,
-) -> int:
+    @njit(cache=True)
+    def _decompress_tof_kernel_calibrated(
+        stream, cal_a, cal_t0, time_resolution,
+        pos_start, start_bin, step, min_bin,
+        mz_out, ints_out, max_out,
+    ) -> int:
         """JIT loop with m/z calibration fused into the kernel."""
         pos = pos_start
         time_bin = start_bin
@@ -149,62 +166,65 @@ def _decompress_tof_kernel_calibrated(
                 time_bin += step
         return count
 
-def _decompress_tof_numba(stream_bytes, number_of_time_bins_to_sum, min_bin, return_arrays=False):
-    """Numba-accelerated decompression (returns raw time bins)."""
-    import numpy as np
-    stream = np.frombuffer(stream_bytes, dtype=np.uint8)
-    length = len(stream)
-    has_marker = length >= 8 and stream[0] == 0xFF and stream[1] == 0xFF and stream[2] == 0xFF and stream[3] == 0xFF
-    if has_marker:
-        start_bin = struct.unpack_from("<I", stream_bytes, 4)[0]
-        pos_start = 8
-        step = number_of_time_bins_to_sum
-    else:
-        start_bin = 1; pos_start = 0; step = 1
-    max_out = length
-    bins_arr = np.empty(max_out, dtype=np.int64)
-    ints_arr = np.empty(max_out, dtype=np.int64)
-    count = _decompress_tof_kernel_fast(stream, pos_start, start_bin, step, min_bin, bins_arr, ints_arr, max_out)
-    if return_arrays:
-        return bins_arr[:count], ints_arr[:count]
-    return bins_arr[:count].tolist(), ints_arr[:count].tolist()
+    def _decompress_tof_numba(stream_bytes, number_of_time_bins_to_sum, min_bin, return_arrays=False):
+        """Numba-accelerated decompression (returns raw time bins)."""
+        stream = np.frombuffer(stream_bytes, dtype=np.uint8)
+        length = len(stream)
+        has_marker = length >= 8 and stream[0] == 0xFF and stream[1] == 0xFF and stream[2] == 0xFF and stream[3] == 0xFF
+        if has_marker:
+            start_bin = struct.unpack_from("<I", stream_bytes, 4)[0]
+            pos_start = 8
+            step = number_of_time_bins_to_sum
+        else:
+            start_bin = 1; pos_start = 0; step = 1
+        max_out = length
+        bins_arr = np.empty(max_out, dtype=np.int64)
+        ints_arr = np.empty(max_out, dtype=np.int64)
+        count = _decompress_tof_kernel_fast(stream, pos_start, start_bin, step, min_bin, bins_arr, ints_arr, max_out)
+        if return_arrays:
+            return bins_arr[:count], ints_arr[:count]
+        return bins_arr[:count].tolist(), ints_arr[:count].tolist()
 
-def _decompress_tof_numba_calibrated(
-    stream_bytes, cal_a, cal_t0, time_resolution,
-    number_of_time_bins_to_sum, min_bin, return_arrays=False,
-):
-    """Numba-accelerated decompression with fused m/z calibration."""
-    import numpy as np
-    stream = np.frombuffer(stream_bytes, dtype=np.uint8)
-    length = len(stream)
-    has_marker = length >= 8 and stream[0] == 0xFF and stream[1] == 0xFF and stream[2] == 0xFF and stream[3] == 0xFF
-    if has_marker:
-        start_bin = struct.unpack_from("<I", stream_bytes, 4)[0]
-        pos_start = 8
-        step = number_of_time_bins_to_sum
-    else:
-        start_bin = 1; pos_start = 0; step = 1
-    max_out = length
-    mz_arr = np.empty(max_out, dtype=np.float64)
-    ints_arr = np.empty(max_out, dtype=np.int64)
-    count = _decompress_tof_kernel_calibrated(
-        stream, cal_a, cal_t0, time_resolution,
-        pos_start, start_bin, step, min_bin,
-        mz_arr, ints_arr, max_out,
-    )
-    if return_arrays:
-        return mz_arr[:count], ints_arr[:count]
-    return mz_arr[:count].tolist(), ints_arr[:count].tolist()
+    def _decompress_tof_numba_calibrated(
+        stream_bytes, cal_a, cal_t0, time_resolution,
+        number_of_time_bins_to_sum, min_bin, return_arrays=False,
+    ):
+        """Numba-accelerated decompression with fused m/z calibration."""
+        stream = np.frombuffer(stream_bytes, dtype=np.uint8)
+        length = len(stream)
+        has_marker = length >= 8 and stream[0] == 0xFF and stream[1] == 0xFF and stream[2] == 0xFF and stream[3] == 0xFF
+        if has_marker:
+            start_bin = struct.unpack_from("<I", stream_bytes, 4)[0]
+            pos_start = 8
+            step = number_of_time_bins_to_sum
+        else:
+            start_bin = 1; pos_start = 0; step = 1
+        max_out = length
+        mz_arr = np.empty(max_out, dtype=np.float64)
+        ints_arr = np.empty(max_out, dtype=np.int64)
+        count = _decompress_tof_kernel_calibrated(
+            stream, cal_a, cal_t0, time_resolution,
+            pos_start, start_bin, step, min_bin,
+            mz_arr, ints_arr, max_out,
+        )
+        if return_arrays:
+            return mz_arr[:count], ints_arr[:count]
+        return mz_arr[:count].tolist(), ints_arr[:count].tolist()
 
-# JIT warm-up at import time
-def _warmup():
-    import numpy as np
-    e = np.empty(0, dtype=np.int64)
-    f = np.empty(0, dtype=np.float64)
-    _decompress_tof_kernel_fast(np.array([], dtype=np.uint8), 0, 0, 1, 0, e, e, 0)
-    _decompress_tof_kernel_calibrated(np.array([], dtype=np.uint8), 1.0, 0.0, 1.0, 0, 0, 1, 0, f, e, 0)
-_warmup()
-del _warmup
+    # JIT warm-up at import time
+    def _warmup():
+        e = np.empty(0, dtype=np.int64)
+        f = np.empty(0, dtype=np.float64)
+        _decompress_tof_kernel_fast(np.array([], dtype=np.uint8), 0, 0, 1, 0, e, e, 0)
+        _decompress_tof_kernel_calibrated(np.array([], dtype=np.uint8), 1.0, 0.0, 1.0, 0, 0, 1, 0, f, e, 0)
+    _warmup()
+    del _warmup
+
+else:
+    def _decompress_tof_numba(stream_bytes, number_of_time_bins_to_sum, min_bin):
+        raise NotImplementedError("numba not installed — use the pure-Python fallback")
+    def _decompress_tof_numba_calibrated(stream_bytes, cal_a, cal_t0, time_resolution, number_of_time_bins_to_sum, min_bin):
+        raise NotImplementedError("numba not installed — use the pure-Python fallback")
 
 
 # --------------------------------------------------------------------------- #
@@ -229,7 +249,8 @@ def decompress_tof(
     When **cal_a**, **cal_t0**, and **time_resolution** are provided, the m/z
     axis is computed and returned in place of raw time bins.
 
-    JIT-compiled numba kernels give near-C performance.
+    If **numba** is installed, JIT-compiled kernels give near-C performance.
+    Otherwise, a pure-Python loop is used (5-10x slower but always available).
 
     Parameters
     ----------
@@ -247,12 +268,28 @@ def decompress_tof(
         pos_start = 0
         step = 1
 
+    # --- fast path: numba JIT ---
+    if _HAS_NUMBA:
+        if cal_a is not None and cal_t0 is not None and time_resolution is not None:
+            return _decompress_tof_numba_calibrated(
+                stream, cal_a, cal_t0, time_resolution,
+                number_of_time_bins_to_sum, min_bin, return_arrays,
+            )
+        return _decompress_tof_numba(stream, number_of_time_bins_to_sum, min_bin, return_arrays)
+
+    # --- pure-Python fallback ---
+    bins, ints = _decode_loop(stream, pos_start, start_bin, step, min_bin)
     if cal_a is not None and cal_t0 is not None and time_resolution is not None:
-        return _decompress_tof_numba_calibrated(
-            stream, cal_a, cal_t0, time_resolution,
-            number_of_time_bins_to_sum, min_bin, return_arrays,
-        )
-    return _decompress_tof_numba(stream, number_of_time_bins_to_sum, min_bin, return_arrays)
+        cal = TofCalibration(cal_a=cal_a, cal_t0=cal_t0, time_resolution=time_resolution)
+        mz = cal.bins_to_masses(bins)
+        if return_arrays:
+            import numpy as np
+            return np.array(mz, dtype=np.float64), np.array(ints, dtype=np.int64)
+        return mz, ints
+    if return_arrays:
+        import numpy as np
+        return np.array(bins, dtype=np.int64), np.array(ints, dtype=np.int64)
+    return bins, ints
 
 
 class TofCalibration:
@@ -341,11 +378,11 @@ def compress_tof(
     # Fixed-bin marker (-1 as little-endian uint32 = FF FF FF FF)
     out.extend([0xFF, 0xFF, 0xFF, 0xFF])
 
-    # Starting bin: first bin minus one step.
+    # Starting bin: first bin minus one step (the DLL stores bin - binSize)
     start_bin = pairs[0][0] - number_of_time_bins_to_sum
     out.extend(struct.pack("<I", start_bin & 0xFFFFFFFF))
 
-    # Leading zero marker.
+    # Leading zero marker (the DLL always adds a 0x00 byte = "zero zeros")
     out.append(0x00)
 
     prev_bin = pairs[0][0]

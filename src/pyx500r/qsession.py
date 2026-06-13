@@ -1,10 +1,8 @@
-"""Pure-Python reader for SCIEX MultiQuant qsession (quantitation session) files.
+"""Pure-Python reader for SCIEX qsession (quantitation session) files.
 
 A ``.qsession`` file is an encrypted SQLite database produced by SCIEX
-MultiQuant software after processing X500R QTOF acquisition data. It stores
-extracted ion chromatograms (XICs), peak integration results, compound
-definitions, audit trails, and quantitation metadata for small-molecule
-and toxicology panels.
+quantitation software (e.g. MultiQuant). It stores extracted ion
+chromatograms (XICs), audit trails, and result metadata.
 
 The encryption scheme is the same AES-128-OFB SEE cipher used for
 ``.wiff2`` files, but with a different password and page size:
@@ -16,7 +14,7 @@ Usage::
 
     from pyx500r import open_qsession
 
-    with open_qsession("quant_results.qsession") as qs:
+    with open_qsession("analysis.qsession") as qs:
         print(qs.version)
         for xic in qs.iter_xics():
             print(f"{xic.xic_id}: {len(xic.times)} points")
@@ -35,12 +33,14 @@ import numpy as np
 from .crypto import QSESSION_PAGE_SIZE, QSESSION_PASSWORD, decrypt_database
 from .models import (
     CompoundInfo,
+    LibraryHit,
     QuantPeakInfo,
     QuantSampleInfo,
     XicChromatogram,
     XicInfo,
 )
 from .rtparts import load_rtparts_stream, read_compounds, read_multidata
+from .xic_gap import build_xic_index, parse_xic_blobs
 
 _XIC_ID_RE = re.compile(
     r"^\[(?P<group>\d+):(?P<replicate>\d+)\]_(?P<type>.) "
@@ -55,7 +55,14 @@ def open_qsession(path: str | Path, password: str = QSESSION_PASSWORD) -> "QSess
 
 
 class QSessionReader:
-    """Pure-Python reader over a single ``.qsession`` quantitation session."""
+    """Pure-Python reader over a single ``.qsession`` quantitation session.
+
+    Supports both v1 (1024-byte pages) and v2 (4096-byte pages) formats.
+    Page size is auto-detected on open.
+    """
+
+    # Both known page sizes, tried in order
+    _PAGE_SIZES = (4096, 1024)
 
     def __init__(self, path: str | Path, password: str = QSESSION_PASSWORD):
         self.path = Path(path).resolve()
@@ -64,11 +71,31 @@ class QSessionReader:
         if not self.path.exists():
             raise FileNotFoundError(f"QSession file does not exist: {self.path}")
 
-        raw_db = decrypt_database(
-            self.path, password, page_size=QSESSION_PAGE_SIZE
-        )
-        self._conn = self._connect(raw_db)
+        raw_db = None
+        last_err = None
+        for page_size in self._PAGE_SIZES:
+            try:
+                raw_db = decrypt_database(
+                    self.path, password, page_size=page_size
+                )
+                self._conn = self._connect(raw_db)
+                break
+            except Exception as e:
+                last_err = e
+                continue
+
+        if self._conn is None:
+            raise OSError(
+                f"Cannot open qsession (tried page sizes {self._PAGE_SIZES}): {last_err}"
+            ) from last_err
+
         self._conn.row_factory = sqlite3.Row
+
+        # Detect format version
+        cur = self._conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_names = {r[0] for r in cur.fetchall()}
+        self._is_v2 = 'MultiData' in table_names
 
         # caches
         self._xic_info_cache: dict[str, XicInfo] = {}
@@ -92,14 +119,22 @@ class QSessionReader:
 
     @staticmethod
     def _connect(raw_db: bytes) -> sqlite3.Connection:
-        conn = sqlite3.connect(":memory:")
-        if hasattr(conn, "deserialize"):
-            conn.deserialize(raw_db)
-            return conn
-        # Fallback for Python builds without serialize/deserialize support.
-        conn.close()
-        import tempfile
+        """Connect to an in-memory SQLite database from raw bytes.
 
+        Tries ``deserialize()`` first (fast, in-memory), falls back to a
+        temp file if the SQLite version doesn't support the page size.
+        """
+        # Try deserialize first
+        if hasattr(sqlite3.Connection, "deserialize"):
+            try:
+                conn = sqlite3.connect(":memory:")
+                conn.deserialize(raw_db)
+                return conn
+            except sqlite3.Error:
+                pass  # fall through to temp file
+
+        # Temp file fallback
+        import tempfile
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         try:
             tmp.write(raw_db)
@@ -332,8 +367,7 @@ class QSessionReader:
             acquisition_date=s.get("acquisition_date"),
         )
 
-    @staticmethod
-    def _peak_info_from_dict(p: dict[str, Any], sample_index: int) -> QuantPeakInfo:
+    def _peak_info_from_dict(self, p: dict[str, Any], sample_index: int, xic_result: dict[str, Any] | None = None) -> QuantPeakInfo:
         """Build a QuantPeakInfo from a MultiData peak dict."""
         return QuantPeakInfo(
             sample_index=sample_index,
@@ -382,6 +416,7 @@ class QSessionReader:
             end_x10_pct_height=p.get("end_x10_pct_height", 0.0),
             std_addn_actual_concentration=p.get("std_addn_actual_concentration", 0.0),
             extracted_ms_ms=p.get("extracted_ms_ms"),
+            xic_result=xic_result,
             super_group_id=p.get("super_group_id"),
         )
 
@@ -447,14 +482,24 @@ class QSessionReader:
         return xic
 
     # ------------------------------------------------------------------ #
-    # compounds (RTParts)
+    # compounds
     # ------------------------------------------------------------------ #
     def list_compounds(self) -> list[CompoundInfo]:
-        """Return all compound definitions from the RTParts table."""
+        """Return all compound definitions."""
         return list(self.iter_compounds())
 
     def iter_compounds(self) -> Iterator[CompoundInfo]:
-        """Iterate over compound definitions from the RTParts table."""
+        """Iterate over compound definitions.
+
+        V1: from RTParts BinaryFormatter blobs.
+        V2: from MultiData.customColumns blob (BF-serialized QuantCompounds).
+        """
+        if self._is_v2:
+            yield from self._iter_compounds_v2()
+        else:
+            yield from self._iter_compounds_v1()
+
+    def _iter_compounds_v1(self) -> Iterator[CompoundInfo]:
         stream = load_rtparts_stream(self._conn)
         compounds, _meta = read_compounds(stream)
         for c in compounds:
@@ -494,26 +539,102 @@ class QSessionReader:
                 extraction_values2=c.get("extraction_values2"),
             )
 
+    def _iter_compounds_v2(self) -> Iterator[CompoundInfo]:
+        """V2: extract compound names from QualPeak (latest QuantResultId per PeakIndex)."""
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT q.PeakIndex, q.CompoundName, q.Formula"
+            " FROM QualPeak q"
+            " INNER JOIN ("
+            "  SELECT PeakIndex, MAX(QuantResultId) AS MaxResult"
+            "  FROM QualPeak GROUP BY PeakIndex"
+            " ) latest ON q.PeakIndex = latest.PeakIndex"
+            "  AND q.QuantResultId = latest.MaxResult"
+            " ORDER BY q.PeakIndex"
+        )
+        for r in cur.fetchall():
+            ci = r["PeakIndex"]
+            yield CompoundInfo(
+                name=r["CompoundName"] or f"Compound_{ci}",
+                group_name="",
+                formula=r["Formula"],
+                charge_formula=None, adduct_formula=None,
+                precursor_mass=0.0, fragment_mass=0.0,
+                extraction_type=0, period=0, experiment=0,
+                mz_lower=0.0, mz_upper=0.0,
+                is_analyte=True, is_reportable=True,
+                is_non_targeted=False, is_summed=False,
+                is_from_multi_period_data=False,
+                isotope_index=0, expected_mw=0.0, units="",
+                comment=None, internal_std_name=None,
+                regression_area=None, regression_type=None,
+                regression_weighting=None, use_auto_regression=None,
+            )
+
     # ------------------------------------------------------------------ #
-    # full RTParts (samples + peaks)
+    # full RTParts (samples + peaks) — V1 only
     # ------------------------------------------------------------------ #
     def _load_multidata(self) -> dict[str, Any]:
-        """Lazy-load the full MultiData object graph from RTParts."""
+        """Lazy-load the full MultiData object graph from RTParts (V1 only)."""
         if self._multidata_cache is None:
             stream = load_rtparts_stream(self._conn)
-            self._multidata_cache = read_multidata(stream)
+            data = read_multidata(stream)
+            raw = stream.getvalue()
+            blobs = parse_xic_blobs(raw)
+            data["xic_lookup"] = build_xic_index(blobs, len(data["samples"]))
+            data["xic_blobs"] = blobs
+            self._multidata_cache = data
         return self._multidata_cache
 
     def list_samples(self) -> list[QuantSampleInfo]:
-        """Return all sample definitions from the RTParts table."""
+        """Return all sample definitions."""
         return list(self.iter_samples())
 
     def iter_samples(self) -> Iterator[QuantSampleInfo]:
-        """Iterate over sample definitions from the RTParts table."""
+        """Iterate over sample definitions."""
+        if self._is_v2:
+            yield from self._iter_samples_v2()
+        else:
+            yield from self._iter_samples_v1()
+
+    def _iter_samples_v1(self) -> Iterator[QuantSampleInfo]:
         data = self._load_multidata()
         for s in data["samples"]:
             yield self._sample_info_from_dict(s)
 
+    def _iter_samples_v2(self) -> Iterator[QuantSampleInfo]:
+        cur = self._conn.cursor()
+        cur.execute("SELECT * FROM MultiSample ORDER BY Id")
+        for row in cur.fetchall():
+            yield QuantSampleInfo(
+                index=row["Id"] - 1,  # 0-based
+                sample_name=row["sampleName"] or "",
+                sample_id=row["sampleId"] or "",
+                sample_type=row["sampleType"] or 0,
+                sample_comment=row["sampleComment"],
+                dilution_factor=row["dilutionFactor"] or 1.0,
+                injection_volume=row["injectionVolume"] or 0.0,
+                user_name=row["userName"],
+                acq_method_name=row["acqMethodName"],
+                instrument_name=row["instrumentName"],
+                instrument_serial_number=row["instrumentSerialNumber"],
+                batch_name=row["batchName"],
+                barcode=row["barcode"],
+                scanned_barcode=row["scannedBarcode"],
+                autosampler_method_supports_barcode=bool(row["autosamplerMethodSupportsBarcode"]),
+                sample_comparison=bool(row["sampleComparison"]),
+                ms_method=row["msMethod"],
+                lc_method=row["lcMethod"],
+                sample_signature=row["sampleSignature"],
+                rack=row["rack"],
+                plate=row["plate"],
+                vial=row["vial"],
+                acquisition_date=row["dateTime"],
+            )
+
+    # ------------------------------------------------------------------ #
+    # peaks
+    # ------------------------------------------------------------------ #
     def iter_peaks(self, sample_index: int | None = None) -> Iterator[QuantPeakInfo]:
         """Iterate over peak results.
 
@@ -523,31 +644,617 @@ class QSessionReader:
             If given, only peaks for this sample are yielded.
             Otherwise all peaks across all samples are yielded.
         """
+        if self._is_v2:
+            yield from self._iter_peaks_v2(sample_index)
+        else:
+            yield from self._iter_peaks_v1(sample_index)
+
+    def _iter_peaks_v1(self, sample_index: int | None = None) -> Iterator[QuantPeakInfo]:
         data = self._load_multidata()
         samples = data["samples"]
         if sample_index is not None:
             samples = [samples[sample_index]]
+        xic = data.get("xic_lookup")
         for s in samples:
             si = s["index"]
             for p in s["peaks"]:
-                yield self._peak_info_from_dict(p, si)
+                xic_result = xic.get((si, p["compound_index"])) if xic else None
+                yield self._peak_info_from_dict(p, si, xic_result)
+
+    def _iter_peaks_v2(self, sample_index: int | None = None) -> Iterator[QuantPeakInfo]:
+        cur = self._conn.cursor()
+        if sample_index is not None:
+            cur.execute(
+                "SELECT * FROM MultiPeak WHERE SampleId = ? ORDER BY Id",
+                (sample_index + 1,),
+            )
+        else:
+            cur.execute("SELECT * FROM MultiPeak ORDER BY Id")
+        for row in cur.fetchall():
+            yield self._peak_info_from_v2_row(row)
 
     def get_sample(self, index: int) -> QuantSampleInfo:
         """Return a single sample by index."""
+        if self._is_v2:
+            cur = self._conn.cursor()
+            cur.execute("SELECT * FROM MultiSample WHERE Id = ?", (index + 1,))
+            row = cur.fetchone()
+            if row is None:
+                raise IndexError(f"Sample index {index} out of range")
+            return next(self._iter_samples_v2_for_row(row))
         data = self._load_multidata()
         if index < 0 or index >= len(data["samples"]):
             raise IndexError(f"Sample index {index} out of range ({len(data['samples'])} samples)")
         return self._sample_info_from_dict(data["samples"][index])
 
+    def _iter_samples_v2_for_row(self, row) -> Iterator[QuantSampleInfo]:
+        yield QuantSampleInfo(
+            index=row["Id"] - 1,
+            sample_name=row["sampleName"] or "",
+            sample_id=row["sampleId"] or "",
+            sample_type=row["sampleType"] or 0,
+            sample_comment=row["sampleComment"],
+            dilution_factor=row["dilutionFactor"] or 1.0,
+            injection_volume=row["injectionVolume"] or 0.0,
+            user_name=row["userName"],
+            acq_method_name=row["acqMethodName"],
+            instrument_name=row["instrumentName"],
+            instrument_serial_number=row["instrumentSerialNumber"],
+            batch_name=row["batchName"],
+            barcode=row["barcode"],
+            scanned_barcode=row["scannedBarcode"],
+            autosampler_method_supports_barcode=bool(row["autosamplerMethodSupportsBarcode"]),
+            sample_comparison=bool(row["sampleComparison"]),
+            ms_method=row["msMethod"],
+            lc_method=row["lcMethod"],
+            sample_signature=row["sampleSignature"],
+            rack=row["rack"],
+            plate=row["plate"],
+            vial=row["vial"],
+            acquisition_date=row["dateTime"],
+        )
+
     def get_peak(self, sample_index: int, compound_index: int) -> QuantPeakInfo:
         """Return the peak for a specific sample and compound."""
+        if self._is_v2:
+            cur = self._conn.cursor()
+            # In v2, PeakIndex within a sample corresponds to compound_index
+            # MultiPeak.Id = sample_id * N + compound_index + 1 (roughly)
+            # Better: use SampleId and PeakIndex
+            cur.execute(
+                "SELECT * FROM MultiPeak WHERE SampleId = ? AND PeakIndex = ?",
+                (sample_index + 1, compound_index),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise IndexError(
+                    f"No peak for sample {sample_index}, compound {compound_index}"
+                )
+            return self._peak_info_from_v2_row(row)
+
         data = self._load_multidata()
         if sample_index < 0 or sample_index >= len(data["samples"]):
             raise IndexError(f"Sample index {sample_index} out of range")
         sample = data["samples"][sample_index]
         if compound_index < 0 or compound_index >= len(sample["peaks"]):
             raise IndexError(f"Compound index {compound_index} out of range")
-        return self._peak_info_from_dict(sample["peaks"][compound_index], sample_index)
+        xic = data.get("xic_lookup")
+        xic_result = xic.get((sample_index, compound_index)) if xic else None
+        return self._peak_info_from_dict(sample["peaks"][compound_index], sample_index, xic_result)
+
+    def _peak_info_from_v2_row(self, row: sqlite3.Row) -> QuantPeakInfo:
+        """Convert a v2 MultiPeak row to QuantPeakInfo,
+        enriched with XIC data from QualPeak."""
+        ci = row["PeakIndex"]
+        si = row["SampleId"] - 1
+        pi = row["Id"]
+        xic_result = self._v2_xic_result(si, ci)
+
+        return QuantPeakInfo(
+            sample_index=si,
+            compound_index=ci,
+            peak_index=row["Id"],
+            use_for_calibration=bool(row["Use"]),
+            peak_comment=row["PeakComment"],
+            actual_concentration=row["ActualConcentration"] or 0.0,
+            failed_query=bool(row["FailedQuery"]),
+            valid_integration=bool(row["ValidIntegration"]),
+            modified=bool(row["Modified"]),
+            retention_time=row["RetentionTime"] or 0.0,
+            area=row["Area"] or 0.0,
+            corrected_area=row["CorrectedArea"] or 0.0,
+            height=row["Height"] or 0.0,
+            corrected_height=row["CorrectedHeight"] or 0.0,
+            start_rt=row["StartRt"] or 0.0,
+            start_y=row["StartY"] or 0.0,
+            end_rt=row["EndRt"] or 0.0,
+            end_y=row["EndY"] or 0.0,
+            half_height_start_rt=row["HalfHeightStartRt"] or 0.0,
+            half_height_end_rt=row["HalfHeightEndRt"] or 0.0,
+            noise=row["Noise"] or 0.0,
+            signal_to_noise=xic_result.get("_signalToNoise") or 0.0,
+            profile_type=row["ProfileType"] or 0,
+            peak_type=row["PeakType"] or 0,
+            apex_rt=row["ApexRt"] or 0.0,
+            apex_y=row["ApexY"] or 0.0,
+            region_area=row["RegionArea"] or 0.0,
+            region_height=row["RegionHeight"] or 0.0,
+            s_mrm_retention_time_shift=bool(row["SMrmRetentionTimeShift"]),
+            row_hidden=bool(row["RowHidden"]),
+            reportable=bool(row["Reportable"]),
+            molecular_weight=row["MolecularWeight"] or 0.0,
+            original_area=row["OriginalArea"] or 0.0,
+            override_experiment_index=row["OverrideExperimentIndex"] or 0,
+            points_across_baseline=row["PointsAcrossBaseline"] or 0,
+            points_across_half_height=row["PointsAcrossHalfHeight"] or 0,
+            integration_parameters=None,
+            profile=None,
+            custom_fields=None,
+            custom_peak_fields=None,
+            start_x5_pct_height=row["StartX5PctHeight"] or 0.0,
+            end_x5_pct_height=row["EndX5PctHeight"] or 0.0,
+            start_x10_pct_height=row["StartX10PctHeight"] or 0.0,
+            end_x10_pct_height=row["EndX10PctHeight"] or 0.0,
+            std_addn_actual_concentration=row["StdAddnActualConcentration"] or 0.0,
+            extracted_ms_ms=row["ExtractedMsms"],
+            xic_result=xic_result,
+            super_group_id=row["SuperGroupId"],
+        )
+
+    def _v2_xic_result(self, sample_index: int, compound_index: int) -> dict[str, Any]:
+        """Build XIC result dict from QualPeak (latest QuantResultId per peak)."""
+        if not hasattr(self, '_v2_qualpeak_index'):
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT q.QuantSampleId, q.PeakIndex,"
+                " q.ContainsMSMS, q.HasBeenCalculated, q.HasLibraryBeenSearched,"
+                " q.FoundAtMass, q.FoundAtRt, q.FoundAtRtApex,"
+                " q.FoundAtRtStart, q.FoundAtRtEnd,"
+                " q.ExtractionMass, q.ExtractionWidth,"
+                " q.IsotopeRatioDiffFromExpected,"
+                " q.LibrarySearchResult,"
+                " q.Formula, q.BaseMass, q.SignalToNoise,"
+                " q.Area, q.Intensity, q.Charge,"
+                " q.ExpectedRt, q.ExpectedRtWidth,"
+                " q.IsQualifier, q.IsInternalStandard,"
+                " q.MsMsExperimentIndex, q.MsMsRetentionTime,"
+                " q.Ms1Cycle, q.MsMsCycle, q.ModificationText"
+                " FROM QualPeak q"
+                " INNER JOIN ("
+                "  SELECT QuantSampleId, PeakIndex, MAX(QuantResultId) AS MaxResult"
+                "  FROM QualPeak GROUP BY QuantSampleId, PeakIndex"
+                " ) latest ON q.QuantSampleId = latest.QuantSampleId"
+                "  AND q.PeakIndex = latest.PeakIndex"
+                "  AND q.QuantResultId = latest.MaxResult"
+            )
+            self._v2_qualpeak_index = {}
+            for r in cur.fetchall():
+                key = (r["QuantSampleId"] - 1, r["PeakIndex"])
+                entry: dict[str, Any] = {
+                    "_containsMSMS": bool(r["ContainsMSMS"]),
+                    "_hasBeenCalculated": bool(r["HasBeenCalculated"]),
+                    "<HasLibraryBeenSearched>k__BackingField": bool(r["HasLibraryBeenSearched"]),
+                    "_foundAtMass": r["FoundAtMass"],
+                    "_foundAtRt": r["FoundAtRt"],
+                    "_foundAtRtApex": r["FoundAtRtApex"],
+                    "<FoundAtRtStart>k__BackingField": r["FoundAtRtStart"],
+                    "<FoundAtRtEnd>k__BackingField": r["FoundAtRtEnd"],
+                    "_extractionMass": r["ExtractionMass"],
+                    "_extractionWidth": r["ExtractionWidth"],
+                    "<IsoptopeRatioDiffFromExpected>k__BackingField": r["IsotopeRatioDiffFromExpected"],
+                    "_formula": r["Formula"],
+                    "_baseMass": r["BaseMass"],
+                    "_signalToNoise": r["SignalToNoise"],
+                    "_area": r["Area"],
+                    "_intensity": r["Intensity"],
+                    "_charge": r["Charge"],
+                    "_rt": r["ExpectedRt"],
+                    "_expectedRtWidth": r["ExpectedRtWidth"],
+                    "_isQualifier": bool(r["IsQualifier"]),
+                    "_isInternalStandard": bool(r["IsInternalStandard"]),
+                    "_msMsExperimentIndex": r["MsMsExperimentIndex"],
+                    "_msMsRetentionTime": r["MsMsRetentionTime"],
+                    "_ms1Cycle": r["Ms1Cycle"],
+                    "_msMsCycle": r["MsMsCycle"],
+                    "_modificationText": r["ModificationText"],
+                }
+                lib_raw = r["LibrarySearchResult"]
+                if lib_raw and lib_raw.strip():
+                    entry["_librarySearchResults"] = self._v2_parse_library_result(lib_raw)
+                self._v2_qualpeak_index[key] = entry
+
+        return self._v2_qualpeak_index.get(
+            (sample_index, compound_index),
+            {"_containsMSMS": False, "_hasBeenCalculated": False},
+        )
+
+    @staticmethod
+    def _v2_parse_library_result(raw: str) -> list[dict[str, Any]]:
+        """Parse QualPeak.LibrarySearchResult pipe-delimited format.
+
+        Format variants (pipe-delimited per line):
+          5-field: count|fit|reverse_fit|guid|is_smart
+          5-field: fit|reverse_fit|count|guid|is_smart
+          3-field: fit|reverse_fit|purity
+        """
+        results = []
+        for line in raw.strip().split("\n"):
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            # Determine which parts are floats vs GUIDs
+            floats = []
+            guid = ""
+            is_smart = False
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                try:
+                    floats.append(float(p))
+                except ValueError:
+                    if "-" in p and len(p) > 30:
+                        guid = p
+                    elif p.lower() in ("true", "false"):
+                        is_smart = p.lower() == "true"
+
+            if len(floats) >= 2:
+                results.append({
+                    "_fit": floats[-3] if len(floats) >= 3 else floats[0],
+                    "_reverseFit": floats[-2] if len(floats) >= 3 else floats[1],
+                    "_purity": floats[-1] if len(floats) >= 3 else 0.0,
+                    "_librarySearchResultId": guid,
+                    "_isSmartConfirmation": is_smart,
+                })
+        return results
+
+    # ── library GUID resolution ──────────────────────────────────
+
+    @staticmethod
+    def guid_dict_to_str(guid_dict: Any) -> str:
+        """Convert a .NET-serialized ``System.Guid`` dict to hex string.
+
+        Handles both the dict form (v1 RTParts) and a plain string (v2 QualPeak).
+        """
+        if isinstance(guid_dict, str):
+            return guid_dict
+        if isinstance(guid_dict, dict):
+            a = guid_dict.get("_a", 0)
+            b = guid_dict.get("_b", 0)
+            c = guid_dict.get("_c", 0)
+            rest = bytes(guid_dict.get(f"_{chr(ord('d') + i)}", 0) for i in range(8))
+            return f"{a:08x}-{b:04x}-{c:04x}-{rest[:2].hex()}-{rest[2:].hex()}"
+        return str(guid_dict) if guid_dict else ""
+
+    def resolve_library_hits(
+        self,
+        library_db: str | Path,
+    ) -> int:
+        """Resolve ``_librarySearchResultId`` GUIDs to library entry names.
+
+        Opens *library_db* (a ``libview_*.sqlite``) and populates
+        ``_librarySearchResults`` entries with ``resolved_name``,
+        ``resolved_formula``, ``resolved_cas`` keys looked up via::
+
+            MassSpectrum.Id → CompoundId → CompoundName.Name
+
+        Returns the number of hits resolved.
+        """
+        import sqlite3
+
+        # Collect all unique GUID strings from cached XIC data
+        guid_set: set[str] = set()
+
+        # Check v2 cache
+        xic_cache = getattr(self, "_v2_qualpeak_index", None) or {}
+        for entry in xic_cache.values():
+            for lr in (entry.get("_librarySearchResults") or []):
+                g = self.guid_dict_to_str(lr.get("_librarySearchResultId", ""))
+                if g:
+                    lr["_librarySearchResultId"] = g
+                    guid_set.add(g)
+
+        # Check v1 multidata cache
+        try:
+            md = self._load_multidata()
+            xic_lookup = md.get("xic_lookup") or {}
+            for key, entry in xic_lookup.items():
+                for lr in (entry.get("_librarySearchResults") or []):
+                    g = self.guid_dict_to_str(lr.get("_librarySearchResultId", ""))
+                    if g:
+                        lr["_librarySearchResultId"] = g
+                        guid_set.add(g)
+        except Exception:
+            pass
+
+        if not guid_set:
+            return 0
+
+        lib = sqlite3.connect(str(library_db))
+        try:
+            cur = lib.cursor()
+            # Build lookup: GUID → (name, formula, cas)
+            lookup: dict[str, tuple[str, str, str]] = {}
+            placeholders = ",".join("?" for _ in guid_set)
+            cur.execute(
+                f"""SELECT DISTINCT ms.Id, cn.Name, c.Formula, c.CAS
+                    FROM MassSpectrum ms
+                    JOIN CompoundName cn ON cn.CompoundId = ms.CompoundId
+                    JOIN Compound c ON c.Id = ms.CompoundId
+                    WHERE ms.Id IN ({placeholders})""",
+                list(guid_set),
+            )
+            for row in cur.fetchall():
+                lookup[row[0]] = (row[1] or "", row[2] or "", row[3] or "")
+
+            # Apply to v2 cache
+            resolved = 0
+            for entry in xic_cache.values():
+                for lr in (entry.get("_librarySearchResults") or []):
+                    g = lr.get("_librarySearchResultId", "")
+                    if g in lookup:
+                        lr["resolved_name"] = lookup[g][0]
+                        lr["resolved_formula"] = lookup[g][1]
+                        lr["resolved_cas"] = lookup[g][2]
+                        resolved += 1
+
+            # Apply to v1 multidata cache
+            try:
+                for key, entry in xic_lookup.items():
+                    for lr in (entry.get("_librarySearchResults") or []):
+                        g = lr.get("_librarySearchResultId", "")
+                        if g in lookup:
+                            lr["resolved_name"] = lookup[g][0]
+                            lr["resolved_formula"] = lookup[g][1]
+                            lr["resolved_cas"] = lookup[g][2]
+                            resolved += 1
+            except Exception:
+                pass
+        finally:
+            lib.close()
+        return resolved
+
+
+
+    def search_library(
+        self,
+        reader: Any,
+        library_db: str | Path,
+        *,
+        ppm_tol: float = 50.0,
+        dot_product_ppm: float = 20.0,
+        prescreen_n: int = 200,
+        top_n: int = 5,
+        polarity_override: str | None = None,
+    ) -> dict[tuple[int, int], list["LibraryHit"]]:
+        """Search an external library for MS/MS spectra linked to this session.
+
+        For every compound × sample peak that has an associated MS/MS
+        spectrum, the spectrum is extracted from the wiff2 *reader* and
+        searched against the *library_db* (a ``libview_*.sqlite`` file).
+
+        Parameters
+        ----------
+        reader:
+            A :class:`~pyx500r.reader.Wiff2Reader` (or compatible object
+            with ``get_spectrum(sample_index, experiment_index, cycle_index)``
+            and ``iter_spectra(sample_index, experiment_index)``) covering
+            the wiff2 files referenced by this session.
+        library_db:
+            Path to a LibraryView ``.sqlite`` database (converted from LBP).
+        ppm_tol:
+            Precursor m/z window in ppm for library pre-screening.
+        dot_product_ppm:
+            Peak-matching tolerance in ppm for dot-product scoring.
+        prescreen_n:
+            Maximum candidates from signature-based pre-screening.
+        top_n:
+            Number of top-scoring library matches to return per peak.
+        polarity_override:
+            If set (``"POS"`` or ``"NEG"``), overrides the polarity
+            detected from the MS/MS experiment. Useful when the wiff2
+            experiment metadata is unreliable.
+
+        Returns
+        -------
+        dict mapping ``(sample_index, compound_index)`` → ``list[LibraryHit]``.
+        Each :class:`LibraryHit` carries ``score``, ``name``, ``formula``,
+        ``cas`` in addition to the standard ``fit``/``reverse_fit`` fields.
+        """
+        from .libsearch import (
+            LibrarySearcher,
+        )
+        import numpy as np
+
+        # Open library once
+        if isinstance(library_db, LibrarySearcher):
+            searcher = library_db
+            _own_searcher = False
+        else:
+            searcher = LibrarySearcher(str(library_db))
+            _own_searcher = True
+
+        try:
+            results: dict[tuple[int, int], list[LibraryHit]] = {}
+
+            # Build compound lookup: compound_index -> CompoundInfo
+            # list_compounds returns compounds in index order
+            compounds_list = self.list_compounds()
+            compound_by_index: dict[int, Any] = {
+                i: c for i, c in enumerate(compounds_list)
+            }
+
+            # Collect all peaks with MS/MS, grouped by sample
+            # Each entry: (QuantPeakInfo, CompoundInfo, xic_result)
+            msms_peaks: dict[
+                int, dict[int, tuple[Any, Any, dict[str, Any]]]
+            ] = {}
+            for peak in self.iter_peaks():
+                if not peak.xic_result:
+                    continue
+                xic = peak.xic_result
+                if not xic.get("_containsMSMS"):
+                    continue
+                msms_exp = xic.get("_msMsExperimentIndex")
+                if msms_exp is None:
+                    continue
+                ci = peak.compound_index
+                if ci in compound_by_index:
+                    msms_peaks.setdefault(peak.sample_index, {})[ci] = (
+                        peak, compound_by_index[ci], xic
+                    )
+
+            if not msms_peaks:
+                return results
+
+            # For each sample, scan MS/MS experiments and find matching spectra
+            for sample_index, peaks in msms_peaks.items():
+                # Get all MS/MS experiment indices used in this sample
+                msms_experiments: set[int] = set()
+                for _peak, _compound, xic in peaks.values():
+                    exp_idx = xic.get("_msMsExperimentIndex")
+                    if exp_idx is not None:
+                        msms_experiments.add(exp_idx)
+
+                # For each MS/MS experiment, collect spectra near the
+                # expected retention times
+                spectrum_cache: dict[
+                    int, dict[float, tuple[np.ndarray, np.ndarray, str]]
+                ] = {}
+
+                for exp_idx in msms_experiments:
+                    spectrum_cache[exp_idx] = {}
+                    try:
+                        for spec in reader.iter_spectra(
+                            sample_index=sample_index,
+                            experiment_index=exp_idx,
+                            return_arrays=True,
+                        ):
+                            if spec.precursor_mz is None:
+                                continue
+                            rt = spec.scan_time
+                            spectrum_cache[exp_idx][rt] = (
+                                np.asarray(spec.mz, dtype=np.float64),
+                                np.asarray(spec.intensities, dtype=np.float64),
+                                spec.precursor_mz,
+                            )
+                    except Exception:
+                        continue
+
+                # Now search each compound against the library
+                for compound_index, (peak, compound, xic) in peaks.items():
+                    exp_idx = xic.get("_msMsExperimentIndex")
+                    if exp_idx is None or exp_idx not in spectrum_cache:
+                        continue
+
+                    target_rt = xic.get("_msMsRetentionTime") or xic.get("_foundAtRt") or 0.0
+                    cache = spectrum_cache[exp_idx]
+
+                    # Find closest MS/MS scan by retention time
+                    if not cache:
+                        continue
+                    rts = sorted(cache.keys())
+                    idx = np.searchsorted(rts, target_rt)
+                    best_rt = target_rt
+                    if idx == 0:
+                        best_rt = rts[0]
+                    elif idx >= len(rts):
+                        best_rt = rts[-1]
+                    else:
+                        if abs(rts[idx] - target_rt) < abs(
+                            rts[idx - 1] - target_rt
+                        ):
+                            best_rt = rts[idx]
+                        else:
+                            best_rt = rts[idx - 1]
+
+                    mz_arr, int_arr, prec_mz = cache[best_rt]
+
+                    # Determine polarity
+                    if polarity_override:
+                        pol = polarity_override
+                    else:
+                        try:
+                            exp = reader._experiment_info(
+                                sample_index, exp_idx
+                            )
+                            pol = exp.polarity
+                        except Exception:
+                            pol = "POS"
+
+                    # Use precursor mass from compound if available
+                    search_prec = float(prec_mz)
+                    if search_prec <= 0 and hasattr(compound, 'precursor_mass'):
+                        search_prec = float(compound.precursor_mass)
+
+                    # Search
+                    hits_raw = searcher.search(
+                        mz_arr,
+                        int_arr,
+                        precursor_mz=search_prec,
+                        polarity=pol,
+                        ppm_tol=ppm_tol,
+                        dot_product_ppm=dot_product_ppm,
+                        prescreen_n=prescreen_n,
+                        top_n=top_n,
+                    )
+
+                    results[(sample_index, compound_index)] = [
+                        LibraryHit(
+                            fit=h["score"],
+                            reverse_fit=h["score"],
+                            purity=h["score"],
+                            name=h["name"],
+                            formula=h["formula"],
+                            cas=h["cas"],
+                            score=h["score"],
+                            precursor_mz=h["precursor_mz"],
+                            collision_energy=h["collision_energy"],
+                            num_peaks=h["num_peaks"],
+                            spectrum_id=h["spectrum_id"],
+                            compound_id=h["compound_id"],
+                        )
+                        for h in hits_raw
+                    ]
+
+            return results
+        finally:
+            if _own_searcher:
+                searcher.close()
+
+    def results_matrix(self) -> list[list[QuantPeakInfo]]:
+        """Return the full samples × compounds peak matrix."""
+        if self._is_v2:
+            return self._results_matrix_v2()
+        return self._results_matrix_v1()
+
+    def _results_matrix_v2(self) -> list[list[QuantPeakInfo]]:
+        samples = self.list_samples()
+        compounds = self.list_compounds()
+        ns = len(samples)
+        nc = len(compounds)
+        matrix: list[list[QuantPeakInfo | None]] = [
+            [None] * nc for _ in range(ns)
+        ]
+        for peak in self.iter_peaks():
+            si = peak.sample_index
+            ci = peak.compound_index
+            if 0 <= si < ns and 0 <= ci < nc:
+                matrix[si][ci] = peak
+        return matrix
+
+    def _results_matrix_v1(self) -> list[list[QuantPeakInfo]]:
+        data = self._load_multidata()
+        xic = data.get("xic_lookup")
+        matrix: list[list[QuantPeakInfo]] = []
+        for s in data["samples"]:
+            si = s["index"]
+            row: list[QuantPeakInfo] = []
+            for p in s["peaks"]:
+                xr = xic.get((si, p["compound_index"])) if xic else None
+                row.append(self._peak_info_from_dict(p, si, xr))
+            matrix.append(row)
+        return matrix
 
     def get_chromatogram(
         self,
@@ -626,21 +1333,6 @@ class QSessionReader:
         )
         self._chromatogram_cache[key] = chrom
         return chrom
-
-    def results_matrix(self) -> list[list[QuantPeakInfo]]:
-        """Return the full results table as a 2-D matrix.
-
-        ``results[sample_index][compound_index]`` gives the
-        :class:`QuantPeakInfo` for that cell.
-        """
-        data = self._load_multidata()
-        return [
-            [
-                self._peak_info_from_dict(p, s["index"])
-                for p in s["peaks"]
-            ]
-            for s in data["samples"]
-        ]
 
     @staticmethod
     def _unpack_doubles(blob: bytes) -> np.ndarray | Sequence[float]:

@@ -27,14 +27,27 @@ dependencies = [
     "cryptography>=41.0.0",
     "numba>=0.58.0",
     "numpy>=1.24.0",
+    "nrbf>=0.1.0",
 ]
 
 # ── optional extras ──
 [project.optional-dependencies]
-# Backward-compatible alias (numba and numpy are now base dependencies)
+# CLI progress bars
+cli = [
+    "tqdm>=4.64.0",
+]
+
+# Web GUI / API examples (see examples/)
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+
+# Backward-compatible alias (numba and numpy are base dependencies)
 all = [
     "numba>=0.58.0",
     "numpy>=1.24.0",
+    "tqdm>=4.64.0",
 ]
 
 # Development / testing
@@ -43,6 +56,14 @@ dev = [
 ]
 
 
+
+[project.scripts]
+pyx500r = "pyx500r.cli:main"
+ppyx500r = "pyx500r.cli_parallel:main"
+pyx500r-qsession = "pyx500r.cli_bridge:main"
+pyx500r-index = "pyx500r.index_builder:main"
+pyx500r-libsearch = "pyx500r.libsearch_cli:main"
+pyx500r-search = "pyx500r.w2searcher:main"
 
 [project.urls]
 Repository = "https://github.com/ykcchong/pyx500r"

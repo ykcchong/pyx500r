@@ -1,4 +1,4 @@
-"""Precursor index for fast precursor m/z lookup across X500R acquisition files.
+"""Precursor index for fast precursor m/z lookup across WIFF2 files.
 
 The index stores a sorted array of precursor m/z values aligned with
 (sample_index, experiment_index, cycle_index) tuples and retention times.
@@ -49,18 +49,20 @@ class PrecursorIndex:
 
         Returns a list of ``(sample_index, experiment_index, cycle_index)`` tuples
         for all matching scan items.
-        """
-        lo = np.searchsorted(self.precursor_mz, target_mz - tolerance_da, side="left")
-        hi = np.searchsorted(self.precursor_mz, target_mz + tolerance_da, side="right")
-        return [self.indices[i] for i in range(lo, hi) if self._ms_level_at(i) == ms_level]
 
-    def _ms_level_at(self, idx: int) -> int:
-        """Return the ms_level for the scan item at position idx.
-
-        This is a lightweight check: we only include MS2 scans.
+        Only MS2 scans are stored in the index, so ``ms_level`` values other
+        than ``2`` always return an empty list.
         """
-        # We store only MS2 scans in the index, so all entries are MS2.
-        return 2
+        if ms_level != 2:
+            return []
+        lo, hi = self._find_range(target_mz, tolerance_da)
+        return [self.indices[i] for i in range(lo, hi)]
+
+    def _find_range(self, target_mz: float, tolerance_da: float) -> tuple[int, int]:
+        """Return the ``[lo, hi)`` slice of entries within tolerance of *target_mz*."""
+        lo = int(np.searchsorted(self.precursor_mz, target_mz - tolerance_da, side="left"))
+        hi = int(np.searchsorted(self.precursor_mz, target_mz + tolerance_da, side="right"))
+        return lo, hi
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -138,36 +140,35 @@ class CrossFilePrecursorIndex:
     def find(
         self,
         precursor_mz: float,
-        fragment_mz: float | None = None,
         precursor_tolerance_da: float = 20.0,
-        fragment_tolerance_da: float = 0.5,
         ms_level: int = 2,
     ) -> list[dict]:
-        """Find all (file, exp, cycle) where precursor matches.
-
-        If ``fragment_mz`` is provided, only returns candidates where the
-        fragment is also present in the decoded spectrum.
+        """Find all ``(file, exp, cycle)`` scan items whose precursor matches.
 
         Returns a list of dicts with keys:
             file_path, sample_index, experiment_index, cycle_index,
-            precursor_mz, retention_time, fragment_matched (bool)
+            precursor_mz, retention_time
+
+        Results are sorted by file path, then by matched precursor m/z.
         """
         results: list[dict] = []
 
         for file_path, idx in self.file_indices.items():
-            candidates = idx.find(precursor_mz, precursor_tolerance_da, ms_level)
-            for sample_idx, exp_idx, cycle_idx in candidates:
-                result = {
+            lo, hi = idx._find_range(precursor_mz, precursor_tolerance_da)
+            if ms_level != 2:
+                continue
+            for i in range(lo, hi):
+                sample_idx, exp_idx, cycle_idx = idx.indices[i]
+                results.append({
                     "file_path": file_path,
                     "sample_index": sample_idx,
                     "experiment_index": exp_idx,
                     "cycle_index": cycle_idx,
-                    "precursor_mz": None,  # filled below
-                    "retention_time": None,
-                    "fragment_matched": fragment_mz is None,
-                }
-                results.append(result)
+                    "precursor_mz": float(idx.precursor_mz[i]),
+                    "retention_time": float(idx.retention_times[i]),
+                })
 
+        results.sort(key=lambda r: (r["file_path"], r["precursor_mz"]))
         return results
 
     def save(self, path: Path) -> None:

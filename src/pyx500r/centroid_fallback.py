@@ -1,4 +1,4 @@
-"""Pure-Python fallback centroiding and spectrum processing for SCIEX X500R QTOF data.
+"""Pure-Python fallback centroiding and spectrum processing for SCIEX WIFF2 data.
 
 This module has **no numba dependency**. It provides a pure-Python + NumPy
 implementation of the centroiding algorithm that is bit-exact with the
@@ -15,7 +15,6 @@ Public API
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import overload
 
 import numpy as np
 from bisect import bisect_left
@@ -29,7 +28,7 @@ from bisect import bisect_left
 class Peak:
     """A single centroided peak.
 
-    Attributes match the shared centroid peak model.
+    Attributes mirror ``Clearcore2.RawXYProcessing.PeakClass``.
     """
     x_value: float   # centroid m/z
     area: float

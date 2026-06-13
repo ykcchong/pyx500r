@@ -77,14 +77,23 @@ dmypy.json
 .DS_Store
 Thumbs.db
 
-# Project specific
+# Project specific — NEVER commit mass-spectrometry data
+data/
 *.scan
+*.wiff
 *.wiff2
-data/encoded/*.wiff
+*.qsession
+*.timeseries.data
+*.timeseries.data-journal
+*.cache.npz
+*.npz
+# LibraryView / library databases (large, proprietary)
+*.lbp
+libview*.sqlite
+*.libdb
 
 # Proprietary / vendor assets (moved out of tree)
 proprietary/
 
 # Backup from refactoring
 src_backup/
-data/

@@ -1,0 +1,3 @@
+# LibraryView browser dependencies (in addition to `pip install -e ".[numba]"`)
+fastapi>=0.110
+uvicorn[standard]>=0.27

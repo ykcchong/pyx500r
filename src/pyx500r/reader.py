@@ -1,15 +1,12 @@
-"""Pure-Python reader for SCIEX X500R QTOF acquisitions.
+"""Pure-Python reader for SCIEX WIFF2 acquisitions.
 
-Reads ``.wiff2`` + ``.wiff.scan`` files produced by the SCIEX X500R QTOF
-system (and compatible SCIEX QTOF platforms). The reader decrypts the
-embedded SQLite database (see :mod:`pyx500r.crypto`), parses acquisition
-metadata, and decodes TOF spectra via :mod:`pyx500r.tof`.
+This reader has **no .NET / DLL dependency**. It decrypts the ``.wiff2`` SQLite
+database (see :mod:`pyx500r.crypto`), reads acquisition metadata from the
+embedded tables, and decodes TOF spectra directly from the companion
+``.wiff.scan`` file using the reverse-engineered codec in :mod:`pyx500r.tof`.
 
-Designed for **small-molecule screening**, **toxicology** and **forensic
-toxicology** workflows where automated extraction of TOF-MS and MS/MS
-spectra from X500R acquisitions is required.
-
-Centroiding is provided by :mod:`pyx500r.centroid`.
+Centroiding is provided by :mod:`pyx500r.centroid` (ported from
+``Clearcore2.RawXYProcessing.SpectralPeakFinder``).
 """
 
 from __future__ import annotations
@@ -341,7 +338,7 @@ class WiffReader:
         cycle_index: int = 0,
     ) -> SpectrumMetadata:
         row = self._scan_item(sample_index, experiment_index, cycle_index)
-        mz, _ = self._decode_spectrum(sample_index, experiment_index, row)
+        point_count = self._decode_point_count(sample_index, experiment_index, row)
         experiment = self._experiment_info(sample_index, experiment_index)
         precursor_mz = self._precursor_mz(row)
         target, lower, upper = self._isolation_window(row)
@@ -353,7 +350,7 @@ class WiffReader:
             scan_type=experiment.scan_type,
             ms_level=experiment.ms_level,
             polarity=experiment.polarity,
-            point_count=len(mz),
+            point_count=point_count,
             precursor_mz=precursor_mz,
             isolation_target_mz=target,
             isolation_lower_offset=lower,
@@ -443,6 +440,31 @@ class WiffReader:
                 f"No scan for sample={sample_index} experiment={experiment_index} cycle={cycle_index}"
             )
         return row
+
+    def _decode_point_count(
+        self, sample_index: int, experiment_index: int, row: sqlite3.Row
+    ) -> int:
+        """Return the number of decoded points without computing the m/z axis.
+
+        Skips the per-point quadratic m/z calibration done in
+        :meth:`_decode_spectrum`, which is unnecessary for metadata.
+        """
+        size = int(row["size"])
+        if size <= 0:
+            return 0
+        start = _SCAN_DATA_OFFSET + int(row["offset"])
+        record = self._scan[start : start + size]
+        sentinel = record.find(_SCAN_SENTINEL)
+        if sentinel < 0:
+            return 0
+        stream = record[sentinel:]
+        n = self._time_bins_to_sum(sample_index, experiment_index)
+        bins, _ = decompress_tof(
+            stream,
+            number_of_time_bins_to_sum=n,
+            return_arrays=True,
+        )
+        return len(bins)
 
     def _decode_spectrum(
         self, sample_index: int, experiment_index: int, row: sqlite3.Row

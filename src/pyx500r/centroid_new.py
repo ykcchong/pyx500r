@@ -7,7 +7,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from numba import njit
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+    def njit(*args, **kwargs):  # noqa: F811
+        def _identity(fn):
+            return fn
+        return _identity
 
 
 # --------------------------------------------------------------------------- #
@@ -468,8 +477,9 @@ def _warmup():
     _centroid_spectrum_fast_njit(x, y, 0.5, False)
 
 
-_warmup()
-del _warmup
+if _HAS_NUMBA:
+    _warmup()
+    del _warmup
 
 
 # --------------------------------------------------------------------------- #
@@ -484,6 +494,9 @@ def centroid_spectrum(mz, intensities, centroid_percentage=50.0, allow_non_zero_
         if return_arrays:
             return np.asarray(mz_out, dtype=np.float64), np.asarray(int_out, dtype=np.float64)
         return mz_out, int_out
+
+    if not _HAS_NUMBA:
+        raise RuntimeError("numba is required for centroid_new")
 
     mz_arr = np.asarray(mz, dtype=np.float64)
     int_arr = np.asarray(intensities, dtype=np.float64)

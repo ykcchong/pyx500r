@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pyx500r — LibraryView Browser</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>LibraryView Browser</h1>
+    <span id="stats" class="stats"></span>
+  </header>
+
+  <main>
+    <!-- ── left: compound list ── -->
+    <section id="list-pane">
+      <div class="controls">
+        <input id="search" type="search" placeholder="Search name / formula / CAS…" autocomplete="off" />
+        <select id="library"><option value="">All libraries</option></select>
+      </div>
+      <div id="compound-list" class="scroll"></div>
+      <div id="pager" class="pager"></div>
+    </section>
+
+    <!-- ── middle: compound settings ── -->
+    <section id="detail-pane">
+      <div id="detail" class="scroll">
+        <p class="placeholder">Select a compound to view its settings.</p>
+      </div>
+    </section>
+
+    <!-- ── right: spectra ── -->
+    <section id="spectra-pane">
+      <div id="spectrum-tabs" class="tabs"></div>
+      <div id="plot-controls" class="plot-controls hidden">
+        <label><input type="radio" name="kind" value="centroid" checked /> Centroid</label>
+        <label><input type="radio" name="kind" value="raw" /> Raw / profile</label>
+        <span id="plot-info" class="plot-info"></span>
+      </div>
+      <canvas id="plot" width="800" height="420"></canvas>
+      <div id="spectrum-meta" class="spectrum-meta"></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

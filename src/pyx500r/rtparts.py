@@ -1,18 +1,73 @@
 """Pure-Python parser for RTParts (compound definitions) in .qsession files.
 
-The RTParts table contains a custom binary serialization. Primitive fields are
-stored as raw binary; complex objects (``double[]``, ``IntegrationParameters``)
-are wrapped in BinaryFormatter blobs.
+The RTParts table contains a custom binary serialization produced by
+``IterativeSerializer`` (Clearcore2.Data).  Primitive fields are raw
+binary; complex objects (``double[]``, ``IntegrationParameters``) are
+wrapped in .NET ``BinaryFormatter`` blobs.
 
-This module uses :mod:`pyx500r.binaryformatter` for parsing those blobs.
+This module uses a pure-Python BinaryFormatter reimplementation
+(:mod:`pyx500r.binaryformatter`) — no .NET / pythonnet dependency.
 """
 from __future__ import annotations
 
 import io
+import json
+import os
 import sqlite3
 import struct
+import subprocess
+import tempfile
+from pathlib import Path
 import re
 from typing import Any
+
+def _find_gap_parser() -> str | None:
+    """Locate the ``bf_gap_parser2.exe`` C# batch binary."""
+    module_dir = Path(__file__).resolve().parent
+    candidates = [
+        module_dir / "bf_gap_parser2.exe",
+        module_dir.parent / "bf_gap_parser2.exe",
+        module_dir.parent.parent / "bf_gap_parser2.exe",
+        Path("bf_gap_parser2.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    for env_path in os.environ.get("PATH", "").split(os.pathsep):
+        p = Path(env_path) / "bf_gap_parser2.exe"
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _parse_gap(raw: bytes, start: int, end: int) -> dict[tuple[int, int], dict[str, Any]] | None:
+    """Parse XicManagerXic objects from the gap using the C# batch parser."""
+    exe = _find_gap_parser()
+    if exe is None:
+        return None
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".gap") as tmp:
+        tmp.write(raw[start:end])
+        tmp_path = tmp.name
+
+    try:
+        result = subprocess.run(
+            ["mono", exe, tmp_path, "0"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            return None
+        objs = json.loads(result.stdout)
+        lookup: dict[tuple[int, int], dict[str, Any]] = {}
+        for obj in objs:
+            lookup[(obj["sample"], obj["compound"])] = obj["data"]
+        return lookup
+    except Exception:
+        return None
+    finally:
+        os.unlink(tmp_path)
 
 from .binaryformatter import (
     parse_bf,
@@ -44,6 +99,25 @@ def _read_name(stream: io.BytesIO) -> tuple[str, bool]:
     name_len = b & 127
     return stream.read(name_len).decode("ascii"), is_null
 
+def _read_tagged_double(stream: io.BytesIO) -> float:
+    """Read a double value, consuming the preceding name tag (no verify)."""
+    b = stream.read(1)[0]
+    name_len = b & 127
+    stream.seek(stream.tell() + name_len)  # skip name bytes
+    if b > 127:  # null
+        return 0.0
+    return struct.unpack("<d", stream.read(8))[0]
+
+
+def _read_tagged_bool(stream: io.BytesIO) -> bool:
+    """Read a bool value, consuming the preceding name tag (no verify)."""
+    b = stream.read(1)[0]
+    name_len = b & 127
+    stream.seek(stream.tell() + name_len)  # skip name bytes
+    if b > 127:  # null
+        return False
+    return stream.read(1)[0] != 0
+
 
 def _read_string(stream: io.BytesIO) -> str:
     length = struct.unpack("<H", stream.read(2))[0]
@@ -70,7 +144,7 @@ def _read_version(stream: io.BytesIO) -> int:
 # BinaryFormatter helpers
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# BinaryFormatter helpers.
+# BinaryFormatter helpers (pure-Python, no pythonnet required)
 # ---------------------------------------------------------------------------
 def _parse_bf_double_array(stream: io.BytesIO) -> list[float] | None:
     """Parse a BinaryFormatter ``double[]`` from the stream."""
@@ -108,19 +182,53 @@ def _parse_bf_integration_parameters(stream: io.BytesIO) -> dict[str, Any] | Non
     return None
 
 
-def _parse_bf_hashtable(stream: io.BytesIO) -> dict[Any, Any] | None:
-    """Parse a BinaryFormatter ``Hashtable`` from the stream."""
-    start = stream.tell()
-    raw = stream.getvalue()
-    result = parse_hashtable(raw[start:start + 500])
-    if result:
-        _, consumed = parse_bf_with_consumed(raw[start:start + 500])
-        stream.seek(start + consumed)
-        return result
-    stream.read(50)
+def _hashtable_to_dict(obj: Any) -> dict[Any, Any] | None:
+    """Convert a parsed ``System.Collections.Hashtable`` object into a dict.
+
+    The BinaryFormatter representation stores parallel ``Keys`` / ``Values``
+    arrays (SerializationInfo form). Zip them into a plain ``{key: value}``
+    mapping, dropping the internal ``__class``/bucket bookkeeping. Returns
+    ``None`` if *obj* is not a recognisable hashtable.
+    """
+    if not isinstance(obj, dict):
+        return None
+    keys = obj.get("Keys")
+    values = obj.get("Values")
+    if isinstance(keys, list) and isinstance(values, list):
+        return {k: v for k, v in zip(keys, values) if k is not None}
+    # Older bucket-based / already-flat dict: strip bookkeeping keys.
+    cls = obj.get("__class", "")
+    if "Hashtable" in str(cls):
+        return {
+            k: v
+            for k, v in obj.items()
+            if k not in ("__class", "LoadFactor", "Version", "Comparer",
+                         "HashCodeProvider", "HashSize", "Keys", "Values")
+        }
     return None
 
 
+def _parse_bf_hashtable(stream: io.BytesIO) -> dict[Any, Any] | None:
+    """Parse a BinaryFormatter ``Hashtable`` from the stream.
+
+    Parses the *full* object graph (so that ``MemberReference`` placeholders to
+    the ``Keys``/``Values`` arrays are resolved) and zips it into a plain dict.
+    """
+    start = stream.tell()
+    raw = stream.getvalue()
+    # Quick check that a hashtable starts here, using a small slice.
+    probe = parse_hashtable(raw[start : start + 500])
+    if not probe:
+        stream.read(50)
+        return None
+    # Re-parse the full graph from *start* so Keys/Values refs resolve.
+    obj, consumed = parse_bf_with_consumed(raw[start:])
+    stream.seek(start + consumed)
+    result = _hashtable_to_dict(obj)
+    if result is not None:
+        return result
+    # Fall back to the (possibly ref-laden) probe result.
+    return probe
 def _parse_bf_float_array(stream: io.BytesIO) -> list[float] | None:
     """Parse a BinaryFormatter ``float[]`` from the stream."""
     start = stream.tell()
@@ -429,16 +537,15 @@ def _decode_multipeak(
     _read_opt_double = _read_optional_double
 
     p["peak_comment"] = _read_opt_str(stream, "_peakComment")
-    p["actual_concentration"] = _read_opt_double(stream, "_actualConcentration")
-    p["failed_query"] = _read_opt_bool(stream, "_failedQuery")
+    p["actual_concentration"] = _read_tagged_double(stream)
+    p["failed_query"] = _read_tagged_bool(stream)
 
     # _customFields (BinaryFormatter Hashtable)
     n, nl = _read_name(stream)
     if n == "_customFields" and not nl:
-        stream.seek(_skip_bf_object(raw, stream.tell(), ["_customPeakFields", "_validIntegration"]))
+        p["custom_fields"] = _parse_bf_hashtable(stream)
     elif n != "_customFields":
         raise ValueError(f"Expected _customFields, got {n!r}")
-
     # _customPeakFields (BinaryFormatter Hashtable, may be absent in old versions)
     pos = stream.tell()
     b = stream.read(1)[0]
@@ -448,23 +555,23 @@ def _decode_multipeak(
     if nlen == len("_customPeakFields") and raw[pos + 1 : pos + 1 + nlen] == b"_customPeakFields":
         n, nl = _read_name(stream)
         if not nl:
-            stream.seek(_skip_bf_object(raw, stream.tell(), ["_validIntegration"]))
+            p["custom_peak_fields"] = _parse_bf_hashtable(stream)
     # else: _customPeakFields is not present, stream stays at current position
 
-    p["valid_integration"] = _read_opt_bool(stream, "_validIntegration")
-    p["modified"] = _read_opt_bool(stream, "_modified")
-    p["retention_time"] = _read_opt_double(stream, "_retentionTime")
-    p["area"] = _read_opt_double(stream, "_area")
-    p["corrected_area"] = _read_opt_double(stream, "_correctedArea")
-    p["height"] = _read_opt_double(stream, "_height")
-    p["corrected_height"] = _read_opt_double(stream, "_correctedHeight")
-    p["start_rt"] = _read_opt_double(stream, "_startRT")
-    p["start_y"] = _read_opt_double(stream, "_startY")
-    p["end_rt"] = _read_opt_double(stream, "_endRT")
-    p["end_y"] = _read_opt_double(stream, "_endY")
-    p["half_height_start_rt"] = _read_opt_double(stream, "_halfHeightStartRT")
-    p["half_height_end_rt"] = _read_opt_double(stream, "_halfHeightEndRT")
-    p["noise"] = _read_opt_double(stream, "_noise")
+    p["valid_integration"] = _read_tagged_bool(stream)
+    p["modified"] = _read_tagged_bool(stream)
+    p["retention_time"] = _read_tagged_double(stream)
+    p["area"] = _read_tagged_double(stream)
+    p["corrected_area"] = _read_tagged_double(stream)
+    p["height"] = _read_tagged_double(stream)
+    p["corrected_height"] = _read_tagged_double(stream)
+    p["start_rt"] = _read_tagged_double(stream)
+    p["start_y"] = _read_tagged_double(stream)
+    p["end_rt"] = _read_tagged_double(stream)
+    p["end_y"] = _read_tagged_double(stream)
+    p["half_height_start_rt"] = _read_tagged_double(stream)
+    p["half_height_end_rt"] = _read_tagged_double(stream)
+    p["noise"] = _read_tagged_double(stream)
 
     # _profile (BinaryFormatter float[])
     n, nl = _read_name(stream)
@@ -475,11 +582,11 @@ def _decode_multipeak(
 
     p["profile_type"] = _read_optional_int(stream, "_profileType")
     p["peak_type"] = _read_optional_int(stream, "_peakType")
-    p["apex_rt"] = _read_opt_double(stream, "_apexRT")
-    p["apex_y"] = _read_opt_double(stream, "_apexY")
-    p["region_area"] = _read_opt_double(stream, "_regionArea")
-    p["region_height"] = _read_opt_double(stream, "_regionHeight")
-    p["s_mrm_retention_time_shift"] = _read_opt_bool(stream, "_sMrmRetentionTimeShift")
+    p["apex_rt"] = _read_tagged_double(stream)
+    p["apex_y"] = _read_tagged_double(stream)
+    p["region_area"] = _read_tagged_double(stream)
+    p["region_height"] = _read_tagged_double(stream)
+    p["s_mrm_retention_time_shift"] = _read_tagged_bool(stream)
 
     # _rowColour (BinaryFormatter Color)
     n, nl = _read_name(stream)
@@ -488,14 +595,14 @@ def _decode_multipeak(
     elif n != "_rowColour":
         raise ValueError(f"Expected _rowColour, got {n!r}")
 
-    p["row_hidden"] = _read_opt_bool(stream, "_rowHidden")
+    p["row_hidden"] = _read_tagged_bool(stream)
 
     # --- Version-dependent tail fields ---
     if version >= 15:
-        p["start_x5_pct_height"] = _read_opt_double(stream, "_startX5PctHeight")
-        p["end_x5_pct_height"] = _read_opt_double(stream, "_endX5PctHeight")
-        p["start_x10_pct_height"] = _read_opt_double(stream, "_startX10PctHeight")
-        p["end_x10_pct_height"] = _read_opt_double(stream, "_endX10PctHeight")
+        p["start_x5_pct_height"] = _read_tagged_double(stream)
+        p["end_x5_pct_height"] = _read_tagged_double(stream)
+        p["start_x10_pct_height"] = _read_tagged_double(stream)
+        p["end_x10_pct_height"] = _read_tagged_double(stream)
         p["points_across_baseline"] = _read_optional_int(stream, "_pointsAcrossBaseline")
         p["points_across_half_height"] = _read_optional_int(stream, "_pointsAcrossHalfHeight")
 
@@ -521,13 +628,13 @@ def _decode_multipeak(
             stream.seek(stream.tell() - 1 - len(n))
 
     if version >= 19:
-        p["reportable"] = _read_opt_bool(stream, "_reportable")
+        p["reportable"] = _read_tagged_bool(stream)
 
     if version >= 20:
-        p["molecular_weight"] = _read_opt_double(stream, "_molecularWeight")
+        p["molecular_weight"] = _read_tagged_double(stream)
 
     if version >= 21:
-        p["original_area"] = _read_opt_double(stream, "_originalArea")
+        p["original_area"] = _read_tagged_double(stream)
 
     if version >= 22:
         p["super_group_id"] = _read_opt_str(stream, "_superGroupId")
@@ -715,17 +822,18 @@ def read_multidata(stream: io.BytesIO) -> dict[str, Any]:
     num_compounds = 0 if nl else _read_int(stream)
     compounds = [_decode_compound(stream) for _ in range(num_compounds)]
 
-    # Remaining QuantMethod fields (BinaryFormatter) – scan to _samples
+    # Remaining QuantMethod fields — parse the gap (XicManagerXic objects)
     raw = stream.getvalue()
     start = stream.tell()
     tag, tag_null = _NAME_TAGS["_samples"]
     idx = raw.find(tag, start)
     if idx == -1:
         idx = raw.find(tag_null, start)
-    if idx != -1:
-        stream.seek(idx)
-    else:
+    if idx == -1:
         raise ValueError("Could not find _samples in stream")
+
+    xic_lookup = _parse_gap(raw, start, idx)
+    stream.seek(idx)
 
     # _samples
     n, nl = _read_name(stream)
@@ -739,6 +847,7 @@ def read_multidata(stream: io.BytesIO) -> dict[str, Any]:
         "qm_version": qm_version,
         "compounds": compounds,
         "samples": samples,
+        "xic_lookup": xic_lookup,
     }
 
 
@@ -765,20 +874,6 @@ def load_rtparts_stream(
     )
     all_bytes = b"".join(row[0] for row in c)
     return io.BytesIO(all_bytes)
-
-
-def iter_compounds(stream: io.BytesIO) -> Any:
-    """Yield decoded compound dictionaries from an RTParts stream."""
-    md_version = _read_version(stream)
-    qm_version = _read_version(stream)
-    n, _ = _read_name(stream)
-    assert n == "fCompounds"
-    num_compounds = _read_int(stream)
-
-    for _ in range(num_compounds):
-        yield _decode_compound(stream)
-
-    return {"md_version": md_version, "qm_version": qm_version, "count": num_compounds}
 
 
 def read_compounds(stream: io.BytesIO) -> tuple[list[dict[str, Any]], dict[str, Any]]:

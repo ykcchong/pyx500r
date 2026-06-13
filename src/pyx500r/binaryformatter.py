@@ -25,13 +25,84 @@ from __future__ import annotations
 import struct
 from datetime import datetime, timedelta
 from typing import Any
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+def _find_bf_cli() -> str | None:
+    """Locate the ``bf_cli.exe`` C# fallback binary."""
+    # Search relative to this module, then in PATH
+    module_dir = Path(__file__).resolve().parent
+    candidates = [
+        module_dir / "bf_cli.exe",
+        module_dir.parent / "bf_cli.exe",
+        module_dir.parent.parent / "bf_cli.exe",
+        Path("bf_cli.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    # Try mono in PATH
+    for env_path in os.environ.get("PATH", "").split(os.pathsep):
+        p = Path(env_path) / "bf_cli.exe"
+        if p.exists():
+            return str(p)
+    return None
+
+
+def parse_bf_with_fallback(data: bytes, offset: int = 0) -> tuple[Any, int]:
+    """Parse a BinaryFormatter blob, falling back to C# ``bf_cli`` on failure.
+
+    Some .NET classes (e.g. ``XicManagerXic``) use a non-standard wire-format
+    ``BinaryTypeEnum`` mapping that the pure-Python parser cannot resolve.
+    When the pure-Python parser raises :class:`BinaryFormatterError`, this
+    function writes the bytes to a temporary file and invokes ``bf_cli.exe``
+    (compiled from ``bf_cli.cs``) via Mono.
+
+    Returns ``(object, consumed_bytes)``.  If both parsers fail, the original
+    exception is re-raised.
+    """
+    try:
+        return parse_bf_with_consumed(data, offset)
+    except (BinaryFormatterError, UnicodeDecodeError, struct.error):
+        pass
+
+    cli = _find_bf_cli()
+    if cli is None:
+        raise BinaryFormatterError(
+            "bf_cli.exe not found; cannot fall back to C# parser"
+        ) from None
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
+        tmp.write(data[offset:])
+        tmp_path = tmp.name
+
+    try:
+        cmd = ["mono", cli, tmp_path, "0"]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            raise BinaryFormatterError(
+                f"bf_cli failed: {result.stderr or result.stdout}"
+            )
+        output = json.loads(result.stdout)
+        if not output.get("success"):
+            raise BinaryFormatterError(
+                f"bf_cli parse error: {output.get('error', 'unknown')}"
+            )
+        return output["data"], output["consumed"]
+    finally:
+        os.unlink(tmp_path)
+
 
 
 class BinaryFormatterError(ValueError):
     """Raised when the stream contains an unexpected record or is truncated."""
 
-
-# ──────────────────────────────────────────────────────────
 # Record-type constants
 # ──────────────────────────────────────────────────────────
 class _Rec:
@@ -39,7 +110,6 @@ class _Rec:
     RefTypeObject = 0x01
     ClassWithId = 0x02
     SystemClassWithMembers = 0x03
-    ClassWithMembers = 0x04
     SystemClassWithMembersAndTypes = 0x04
     ClassWithMembersAndTypes = 0x05
     BinaryObjectString = 0x06
@@ -82,15 +152,51 @@ class _Prim:
 # ──────────────────────────────────────────────────────────
 # BinaryType enum
 # ──────────────────────────────────────────────────────────
+class _BAType:
+    """BinaryArrayTypeEnum – distinct from BinaryTypeEnum."""
+    Single = 0
+    Double = 1
+    Decimal = 2
+    Boolean = 3
+    Int16 = 4
+    Int32 = 5
+    Int64 = 6
+    String = 7
+    StringArray = 8
+    ObjectArray = 9
+
+class _Ref:
+    """Lazy forward-reference placeholder for MS-NRBF MemberReference."""
+    __slots__ = ("ref_id",)
+
+    def __init__(self, ref_id: int) -> None:
+        self.ref_id = ref_id
+
+    def resolve(self, objects: dict[int, Any]) -> Any:
+        return objects.get(self.ref_id)
+
+
 class _BType:
     Primitive = 0
     String = 1
     Object = 2
-    ObjectArray = 3
-    StringArray = 4
-    PrimitiveArray = 5
-    Class = 6
-    SystemClass = 7
+    SystemClass = 3
+    Class = 4
+    ObjectArray = 5
+    StringArray = 6
+    PrimitiveArray = 7
+
+
+def _resolve_refs(obj: Any, objects: dict[int, Any]) -> Any:
+    """Walk *obj* recursively and replace any ``_Ref`` with its resolved value."""
+    if isinstance(obj, _Ref):
+        resolved = obj.resolve(objects)
+        return _resolve_refs(resolved, objects)
+    if isinstance(obj, dict):
+        return {k: _resolve_refs(v, objects) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_refs(v, objects) for v in obj]
+    return obj
 
 
 class _BfReader:
@@ -101,8 +207,7 @@ class _BfReader:
         self.pos = offset
         self.objects: dict[int, Any] = {}
         self.libraries: dict[int, str] = {}
-
-    # ── helpers ──
+        self.class_info: dict[int, dict[str, Any]] = {}
     def _u8(self) -> int:
         b = self.raw[self.pos]
         self.pos += 1
@@ -224,16 +329,21 @@ class _BfReader:
         return obj_id, name, member_count, member_names
 
     def _read_member_type_info(self, member_count: int) -> tuple[list[int], list[Any]]:
-        """MemberTypeInfo: binary_types[], type_info[]."""
+        """MemberTypeInfo: binary_types[], type_info[].
+
+        For ``Class`` (bt=4) the additional info is a ``ClassTypeInfo``
+        containing a type-name string *and* a 4-byte ``LibraryId``.
+        For ``SystemClass`` (bt=3) only the type-name string is present.
+        """
         binary_types = [self._u8() for _ in range(member_count)]
         type_infos: list[Any] = []
         for bt in binary_types:
-            if bt == _BType.Primitive:
-                type_infos.append(self._u8())
-            elif bt == _BType.PrimitiveArray:
+            if bt == _BType.Primitive or bt == _BType.PrimitiveArray:
                 type_infos.append(self._u8())
             elif bt in (_BType.Class, _BType.SystemClass):
                 type_infos.append(self._string())
+                if bt == _BType.Class:
+                    self._i32()  # consume LibraryId
             else:
                 type_infos.append(None)
         return binary_types, type_infos
@@ -241,17 +351,80 @@ class _BfReader:
     def _read_class_with_members_and_types(self, is_system: bool) -> dict[str, Any]:
         obj_id, class_name, member_count, member_names = self._read_class_info()
         binary_types, type_infos = self._read_member_type_info(member_count)
+        library_id = None
         if not is_system:
-            self._i32()  # library id
-
+            library_id = self._i32()
         result: dict[str, Any] = {"__class": class_name}
         for mname, btype, tinfo in zip(member_names, binary_types, type_infos):
             result[mname] = self._read_member_value(btype, tinfo)
-
+        self.objects[obj_id] = result
+        self.class_info[obj_id] = {
+            "class_name": class_name,
+            "member_names": member_names,
+            "binary_types": binary_types,
+            "type_infos": type_infos,
+            "library_id": library_id,
+        }
+        return result
+    def _read_class_with_id(self) -> dict[str, Any]:
+        """ClassWithId (0x02) – references a previous ClassInfo by metadata_id."""
+        obj_id = self._i32()
+        metadata_id = self._i32()
+        meta = self.class_info.get(metadata_id)
+        if meta is None:
+            raise BinaryFormatterError(
+                f"ClassWithId references unknown metadata_id {metadata_id}"
+            )
+        result: dict[str, Any] = {"__class": meta["class_name"]}
+        for mname, btype, tinfo in zip(
+            meta["member_names"], meta["binary_types"], meta["type_infos"]
+        ):
+            result[mname] = self._read_member_value(btype, tinfo)
         self.objects[obj_id] = result
         return result
 
+    def _read_array_single_object(self) -> list[Any]:
+        """ArraySingleObject (0x10)."""
+        obj_id = self._i32()
+        length = self._i32()
+        result = [self._read_record() for _ in range(length)]
+        self.objects[obj_id] = result
+        return result
+    def _read_system_class_with_members(self) -> dict[str, Any]:
+        """SystemClassWithMembers (0x03) – no MemberTypeInfo; read values as records."""
+        obj_id, class_name, member_count, member_names = self._read_class_info()
+        result: dict[str, Any] = {"__class": class_name}
+        for mname in member_names:
+            result[mname] = self._read_record()
+        self.objects[obj_id] = result
+        self.class_info[obj_id] = {
+            "class_name": class_name,
+            "member_names": member_names,
+            "binary_types": [],
+            "type_infos": [],
+            "library_id": None,
+        }
+        return result
     def _read_member_value(self, btype: int, tinfo: Any) -> Any:
+        # For non-primitive types, ObjectNull (0x01),
+        # MemberPrimitiveTyped (0x08), and MemberReference (0x09)
+        # markers may appear before the actual value.
+        # Primitive types skip marker checks to avoid false positives
+        # (e.g. Boolean True = 0x01 collides with ObjectNull).
+        if btype not in (_BType.Primitive, _BType.PrimitiveArray):
+            rec = self.raw[self.pos]
+            if rec == _Rec.ObjectNull:
+                self.pos += 1
+                return None
+            if rec == _Rec.MemberPrimitiveTyped:
+                self.pos += 1
+                return self._primitive(self._u8())
+            if rec == _Rec.MemberReference:
+                self.pos += 1
+                ref_id = self._i32()
+                if ref_id not in self.objects:
+                    return _Ref(ref_id)
+                return self.objects[ref_id]
         if btype == _BType.Primitive:
             return self._primitive(tinfo)
         if btype == _BType.String:
@@ -321,25 +494,27 @@ class _BfReader:
             raise BinaryFormatterError(
                 f"Unsupported array primitive type {ptype} at {self.pos}"
             )
-
-        result = list(data)
-        self.objects[obj_id] = result
-        return result
+        data = list(data)
+        self.objects[obj_id] = data
+        return data
 
     def _read_binary_array(self) -> list[Any]:
-        """BinaryArray (0x07) – used for List<T>._items etc."""
+        """BinaryArray (0x07) – MS-NRBF §2.5.5."""
         obj_id = self._i32()
+        _array_type = self._u8()  # BinaryArrayTypeEnum (unused by reader)
         rank = self._i32()
         lengths = [self._i32() for _ in range(rank)]
-        lower_bounds = [self._i32() for _ in range(rank)]  # noqa: F841
-        array_type = self._u8()
+        # LowerBounds are optional; skip them (always zero for 1-D arrays).
 
-        # array_type is the BinaryTypeEnum for elements
-        element_type_info: Any = None
-        if array_type == _BType.Primitive:
-            element_type_info = self._u8()
-        elif array_type in (_BType.Class, _BType.SystemClass):
-            element_type_info = self._string()
+        # Element type: BinaryTypeEnum byte followed by additional info.
+        element_bt = self._u8()
+        element_info: Any = None
+        if element_bt in (_BType.Primitive, _BType.PrimitiveArray):
+            element_info = self._u8()
+        elif element_bt in (_BType.Class, _BType.SystemClass):
+            element_info = self._string()
+            if element_bt == _BType.Class:
+                self._i32()  # LibraryId
 
         total_length = 1
         for ln in lengths:
@@ -347,16 +522,12 @@ class _BfReader:
 
         result: list[Any] = []
         for _ in range(total_length):
-            if array_type == _BType.Primitive:
-                result.append(self._primitive(element_type_info))
-            elif array_type == _BType.String:
+            if element_bt == _BType.Primitive:
+                result.append(self._primitive(element_info))
+            elif element_bt in (_BType.Class, _BType.SystemClass, _BType.Object):
+                result.append(self._read_record())
+            elif element_bt == _BType.String:
                 result.append(self._read_string_value())
-            elif array_type == _BType.Object:
-                result.append(self._read_record())
-            elif array_type == _BType.ObjectNull:
-                result.append(None)
-            elif array_type == _BType.PrimitiveArray:
-                result.append(self._read_record())
             else:
                 result.append(self._read_record())
 
@@ -364,25 +535,30 @@ class _BfReader:
         return result
 
     def _read_hashtable(self) -> dict[Any, Any]:
-        """Read a System.Collections.Hashtable from BinaryFormatter.
-
-        Hashtables are ISerializable, so the record is a
-        ``ClassWithMembersAndTypes`` for the Hashtable class with
-        ``m_info`` / ``m_context`` members that contain the real data.
-        However, in the RTParts stream we usually see them stored as a
-        plain ``ClassWithMembersAndTypes`` with bucket/key/value arrays.
-        This helper tries both paths.
-        """
-        rec = self.raw[self.pos]
-        if rec not in (_Rec.SystemClassWithMembersAndTypes, _Rec.ClassWithMembersAndTypes):
+        """Read a System.Collections.Hashtable from BinaryFormatter."""
+        # Skip Header (0x00) and BinaryLibrary (0x0C) records
+        while self.pos < len(self.raw):
+            rec = self.raw[self.pos]
+            if rec in (_Rec.SystemClassWithMembersAndTypes, _Rec.ClassWithMembersAndTypes):
+                break
+            if rec == _Rec.Header:
+                self.pos += 17
+                continue
+            if rec == _Rec.BinaryLibrary:
+                self.pos += 1
+                lib_id = self._i32()
+                lib_name = self._string()
+                self.libraries[lib_id] = lib_name
+                continue
             raise BinaryFormatterError(
                 f"Expected Hashtable class record, got 0x{rec:02x} at {self.pos}"
             )
+        if self.pos >= len(self.raw):
+            raise BinaryFormatterError("Unexpected end of stream looking for Hashtable")
 
-        is_system = rec == _Rec.SystemClassWithMembersAndTypes
+        is_system = self.raw[self.pos] == _Rec.SystemClassWithMembersAndTypes
         self.pos += 1
         obj = self._read_class_with_members_and_types(is_system)
-
         # If the object has a direct ``buckets`` member it is the older
         # field-based format; otherwise we try to reconstruct from the
         # ``m_info`` SerializationInfo entries.
@@ -431,10 +607,12 @@ class _BfReader:
 
         if rec == _Rec.SystemClassWithMembersAndTypes:
             return self._read_class_with_members_and_types(is_system=True)
-
         if rec == _Rec.ClassWithMembersAndTypes:
             return self._read_class_with_members_and_types(is_system=False)
-
+        if rec == _Rec.ClassWithId:
+            return self._read_class_with_id()
+        if rec == _Rec.SystemClassWithMembers:
+            return self._read_system_class_with_members()
         if rec == _Rec.BinaryObjectString:
             return self._read_binary_object_string()
 
@@ -446,7 +624,7 @@ class _BfReader:
             ref_id = self._i32()
             return self.objects.get(ref_id)
 
-        if rec == _Rec.ObjectNull:
+        if rec == _Rec.ObjectNull or rec == 0x01:
             return None
 
         if rec == _Rec.MessageEnd:
@@ -474,6 +652,8 @@ class _BfReader:
 
         if rec == _Rec.ArraySingleString:
             return self._read_array_single_string()
+        if rec == _Rec.ArraySingleObject:
+            return self._read_array_single_object()
 
         raise BinaryFormatterError(
             f"Unsupported record type 0x{rec:02x} at position {self.pos - 1}"
@@ -485,8 +665,6 @@ class _BfReader:
         result = [self._read_string_value() for _ in range(length)]
         self.objects[obj_id] = result
         return result
-
-    # ── public entry point ──
     def parse(self) -> Any:
         """Parse the stream and return the top-level deserialized object."""
         result = None
@@ -498,14 +676,12 @@ class _BfReader:
             obj = self._read_record()
             if result is None and obj is not None:
                 result = obj
+        if result is not None:
+            result = _resolve_refs(result, self.objects)
         return result
-
     @property
     def bytes_consumed(self) -> int:
         return self.pos
-
-
-# ═══════════════════════════════════════════════════════════
 # Public API
 # ═══════════════════════════════════════════════════════════
 

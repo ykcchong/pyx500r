@@ -4,6 +4,8 @@
   (TOF-MS and MS/MS) with zero .NET dependency.
 * ``QSessionReader`` reads MultiQuant ``.qsession`` quantitation result
   tables (XICs, peak integration results, compound libraries).
+* ``WiffQSessionBridge`` pairs acquisitions with their quantitation
+  results for unified compound × sample access.
 * ``PrecursorIndex`` / ``build_precursor_index`` provide O(log n) binary
   search for batch precursor lookup across large toxicology/small-molecule
   file cohorts.
@@ -29,7 +31,7 @@ Quick start — MultiQuant qsession::
 
 from __future__ import annotations
 
-# ── Always available (pure-Python) ──
+# ── Always available (pure-Python, no .NET / no DLL) ──
 from .centroid import Peak, add_framing_zeros, centroid_spectrum, moving_average_smooth
 from .crypto import (
     PAGE_SIZE,
@@ -52,9 +54,12 @@ from .models import (
     SpectrumMetadata,
     XicChromatogram,
     XicInfo,
+    UnifiedPeak,
+    LibraryHit,
 )
 from .qsession import QSessionReader, open_qsession
 from .reader import WiffReader, open_wiff2
+from .bridge import WiffQSessionBridge, ExtractionWindow
 from .rtparts import load_rtparts_stream, read_compounds
 from .tof import (
     MassRange,
@@ -67,8 +72,17 @@ from .tof import (
     time_to_mass,
 )
 
-# ── Precursor index ──
-from .index import PrecursorIndex, build_precursor_index
+# ── Precursor index (requires numpy) ──
+try:
+    from .index import (
+        CrossFilePrecursorIndex,
+        PrecursorIndex,
+        build_precursor_index,
+    )
+except ImportError:
+    CrossFilePrecursorIndex = None  # type: ignore[assignment]
+    PrecursorIndex = None  # type: ignore[assignment]
+    build_precursor_index = None  # type: ignore[assignment]
 
 __all__ = [
     # data models
@@ -83,10 +97,15 @@ __all__ = [
     "SpectrumMetadata",
     "XicChromatogram",
     "XicInfo",
+    # WIFF2 reader
     "WiffReader",
     "open_wiff2",
+    # QSession reader
     "QSessionReader",
     "open_qsession",
+    # Bridge
+    "WiffQSessionBridge",
+    "ExtractionWindow",
     "load_rtparts_stream",
     "read_compounds",
     # TOF decompression / compression
@@ -98,7 +117,7 @@ __all__ = [
     "mass_to_time",
     "time_to_mass",
     "MassRange",
-    # centroiding
+    # centroiding (ported from Clearcore2.RawXYProcessing)
     "centroid_spectrum",
     "add_framing_zeros",
     "moving_average_smooth",
@@ -113,5 +132,6 @@ __all__ = [
     "decrypt_page",
     # precursor index (requires numpy)
     "PrecursorIndex",
+    "CrossFilePrecursorIndex",
     "build_precursor_index",
 ]
