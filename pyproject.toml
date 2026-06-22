@@ -43,6 +43,12 @@ server = [
     "uvicorn[standard]>=0.27",
 ]
 
+# Native GUI (Tkinter + matplotlib)
+gui = [
+    "matplotlib>=3.7.0",
+    "pyteomics>=4.7",
+]
+
 # Backward-compatible alias (numba and numpy are base dependencies)
 all = [
     "numba>=0.58.0",
@@ -64,6 +70,7 @@ pyx500r-qsession = "pyx500r.cli_bridge:main"
 pyx500r-index = "pyx500r.index_builder:main"
 pyx500r-libsearch = "pyx500r.libsearch_cli:main"
 pyx500r-search = "pyx500r.w2searcher:main"
+pyx500r-gui = "pyx500r.wiff_gui:main"
 
 [project.urls]
 Repository = "https://github.com/ykcchong/pyx500r"
