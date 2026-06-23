@@ -1,3 +1,3 @@
-# Reference server dependencies (in addition to `pip install -e ".[numba]"`)
+# Reference server dependencies (also available via `pip install -e ".[server]"`)
 fastapi>=0.110
 uvicorn[standard]>=0.27

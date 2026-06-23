@@ -37,7 +37,16 @@ _TWO_BYTE_VAL = 125
 _FOUR_BYTE_VAL = 126
 _MAX_ONE_BYTE_VAL = 123
 _STOP_MARKER = 0xFF
-_FIXED_BIN_MARKER = b"\xff\xff\xff\xff"
+
+
+def _has_fixed_bin_marker(stream) -> bool:
+    return (
+        len(stream) >= 8
+        and stream[0] == 0xFF
+        and stream[1] == 0xFF
+        and stream[2] == 0xFF
+        and stream[3] == 0xFF
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -170,7 +179,7 @@ if _HAS_NUMBA:
         """Numba-accelerated decompression (returns raw time bins)."""
         stream = np.frombuffer(stream_bytes, dtype=np.uint8)
         length = len(stream)
-        has_marker = length >= 8 and stream[0] == 0xFF and stream[1] == 0xFF and stream[2] == 0xFF and stream[3] == 0xFF
+        has_marker = _has_fixed_bin_marker(stream)
         if has_marker:
             start_bin = struct.unpack_from("<I", stream_bytes, 4)[0]
             pos_start = 8
@@ -192,7 +201,7 @@ if _HAS_NUMBA:
         """Numba-accelerated decompression with fused m/z calibration."""
         stream = np.frombuffer(stream_bytes, dtype=np.uint8)
         length = len(stream)
-        has_marker = length >= 8 and stream[0] == 0xFF and stream[1] == 0xFF and stream[2] == 0xFF and stream[3] == 0xFF
+        has_marker = _has_fixed_bin_marker(stream)
         if has_marker:
             start_bin = struct.unpack_from("<I", stream_bytes, 4)[0]
             pos_start = 8
@@ -258,7 +267,7 @@ def decompress_tof(
         This avoids a list→numpy round-trip when the output is fed directly
         into centroiding or other array-based consumers.
     """
-    has_marker = len(stream) >= 8 and stream[0:4] == _FIXED_BIN_MARKER
+    has_marker = _has_fixed_bin_marker(stream)
     if has_marker:
         start_bin = struct.unpack_from("<I", stream, 4)[0]
         pos_start = 8

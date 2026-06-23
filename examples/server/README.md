@@ -9,8 +9,7 @@ the matching TypeScript interfaces.
 
 ```bash
 # from the repo root
-pip install -e ".[numba]"
-pip install -r examples/server/requirements.txt
+pip install -e ".[server]"
 
 export PYX500R_DATA_ROOT=./data          # folder containing your .wiff2/.qsession
 uvicorn examples.server.app:app --reload --port 8000

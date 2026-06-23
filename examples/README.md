@@ -10,8 +10,7 @@ Runnable applications built on the `pyx500r` library.
 Both require the FastAPI extras on top of the base install:
 
 ```bash
-pip install -e ".[numba]"
-pip install -r examples/<example>/requirements.txt
+pip install -e ".[server]"
 ```
 
 Then follow the per-example README to launch `uvicorn`.

@@ -21,8 +21,7 @@ instruments) — rendered as interactive plots in the browser.
 
 ```bash
 # from the repo root
-pip install -e ".[numba]"
-pip install -r examples/library_browser/requirements.txt
+pip install -e ".[server]"
 
 export PYX500R_LIBRARY_DB=data/libview.sqlite
 uvicorn examples.library_browser.app:app --reload --port 8001

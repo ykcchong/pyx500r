@@ -6,8 +6,7 @@ rendered as interactive plots.
 
 Run::
 
-    pip install -e ".[numba]"
-    pip install -r examples/library_browser/requirements.txt
+    pip install -e ".[server]"
     export PYX500R_LIBRARY_DB=path/to/your/libview.sqlite
     uvicorn examples.library_browser.app:app --reload --port 8001
 
@@ -28,7 +27,7 @@ try:
 except ImportError as exc:  # pragma: no cover - dependency hint
     raise SystemExit(
         "FastAPI is not installed. Run:\n"
-        "    pip install -r examples/library_browser/requirements.txt"
+        "    pip install -e \".[server]\""
     ) from exc
 
 from .library_db import LibraryDB

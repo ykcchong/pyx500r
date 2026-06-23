@@ -34,11 +34,15 @@ recipe and [`types.ts`](./types.ts) for ready-made TypeScript interfaces.
 ## Installation & feature flags
 
 ```bash
-pip install -e .            # pure-Python: crypto + models + readers + slow TOF
-pip install -e .[numba]     # + numba/numpy JIT — ~10× faster TOF & centroiding
+conda create -n pyx500r python=3.12 pip
+conda activate pyx500r
+
+pip install -e .            # core reader + numba/numpy JIT acceleration
 pip install -e .[cli]       # + tqdm for CLI progress bars
-pip install -e .[all]       # everything
-pip install -e .[dev]       # + pytest, ruff
+pip install -e .[server]    # + FastAPI/Uvicorn example apps
+pip install -e .[gui]       # + matplotlib/pyteomics native GUI
+pip install -e .[all]       # CLI + server + GUI optional dependencies
+pip install -e .[dev]       # + pytest
 ```
 
 | Capability | Base install | Needs `numpy` | Needs `numba` |
@@ -50,8 +54,9 @@ pip install -e .[dev]       # + pytest, ruff
 | `PrecursorIndex`, `build_precursor_index` | | ✅ | |
 | `centroid_spectrum` (fast path) | falls back to NumPy/Python | ✅ | ✅ (best) |
 
-`numpy` is pulled in by both the `numba` extra and transitively used by the
-index/centroiding code. The base install degrades gracefully when it is absent.
+`numpy` and `numba` are base dependencies so Conda/pip installs get the fast
+decode and centroiding paths by default. The `[numba]` extra is kept as a
+backward-compatible no-op for older install commands.
 
 ---
 
@@ -455,7 +460,7 @@ results = qs.search_library(
 
 The lower-level `pyx500r.libsearch.LibrarySearcher` can be used directly to
 search arbitrary peak lists; see `pyx500r/libsearch.py` and the
-`pyx500r-libsearch` CLI.
+`x500rlibsearch` CLI.
 
 ---
 
@@ -744,20 +749,21 @@ Without `numba`, TOF decode and centroiding are ~5–10× slower but byte-identi
 
 Installed as console scripts (see `pyproject.toml [project.scripts]`):
 
-| Command | Module | Purpose |
-|---------|--------|---------|
-| `pyx500r` | `pyx500r.cli` | List samples / find precursor→product transitions |
-| `ppyx500r` | `pyx500r.cli_parallel` | Same, multiprocess (`-j N`) |
-| `pyx500r-index` | `pyx500r.index_builder` | Build an `.npz` MS2 product-ion index |
-| `pyx500r-search` | `pyx500r.w2searcher` | Query an `.npz` index (TUI + one-shot) |
-| `pyx500r-qsession` | `pyx500r.cli_bridge` | Interactive qsession results explorer |
-| `pyx500r-libsearch` | `pyx500r.libsearch_cli` | Search MGF/peaks against a LibraryView DB |
+| Command | Compatibility alias | Module | Purpose |
+|---------|---------------------|--------|---------|
+| `x500r` | `pyx500r` | `pyx500r.cli` | List samples / find precursor→product transitions |
+| `x500rp` | `ppyx500r` | `pyx500r.cli_parallel` | Same, multiprocess (`-j N`) |
+| `x500rindex` | `pyx500r-index` | `pyx500r.index_builder` | Build an `.npz` MS2 product-ion index |
+| `x500rsearch` | `pyx500r-search` | `pyx500r.w2searcher` | Query an `.npz` index (TUI + one-shot) |
+| `x500rqsession` | `pyx500r-qsession` | `pyx500r.cli_bridge` | Interactive qsession results explorer |
+| `x500rlibsearch` | `pyx500r-libsearch` | `pyx500r.libsearch_cli` | Search MGF/peaks against a LibraryView DB |
+| `x500rgui` | `pyx500r-gui` | `pyx500r.wiff_gui` | Launch the native WIFF browser GUI |
 
 ```bash
-pyx500r list acquisition.wiff2
-pyx500r transitions "*.wiff2" --precursor-mz 456.2 --tolerance-ppm 20
-pyx500r transitions file.wiff2 -t "250.1587:191.0857,163.0907,109.0443" --json
-pyx500r-qsession results.qsession ./wiff_dir --library-db libview.sqlite
+x500r list acquisition.wiff2
+x500r transitions "*.wiff2" --precursor-mz 456.2 --tolerance-ppm 20
+x500r transitions file.wiff2 -t "250.1587:191.0857,163.0907,109.0443" --json
+x500rqsession results.qsession ./wiff_dir --library-db libview.sqlite
 ```
 
 Every CLI `main(argv=None) -> int` is importable and testable.

@@ -1,12 +1,12 @@
-"""Parallel version of ``pyx500r`` CLI — multiprocess-accelerated transitions.
+"""Parallel version of ``x500r`` CLI — multiprocess-accelerated transitions.
 
 Usage::
 
-    ppyx500r list "*.wiff2"
-    ppyx500r transitions "*.wiff2" --precursor-mz 456.2 --tolerance-ppm 20
-    ppyx500r transitions "*.wiff2" -t "250.1587:191.0857,163.0907,109.0443" -j 8
+    x500rp list "*.wiff2"
+    x500rp transitions "*.wiff2" --precursor-mz 456.2 --tolerance-ppm 20
+    x500rp transitions "*.wiff2" -t "250.1587:191.0857,163.0907,109.0443" -j 8
 
-Same interface as ``pyx500r`` but distributes per-file work across a
+Same interface as ``x500r`` but distributes per-file work across a
 ``multiprocessing.Pool`` for the ``transitions`` command.  ``list`` is
 unchanged (it is I/O-bound, not CPU-bound).
 """

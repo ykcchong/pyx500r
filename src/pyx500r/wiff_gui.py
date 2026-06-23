@@ -12,7 +12,7 @@ Provides:
 
 Usage::
 
-    pyx500r-gui
+    x500rgui
     # or
     python -m pyx500r.wiff_gui
 
@@ -21,6 +21,8 @@ Dependencies: ``matplotlib``.  Optional: ``pyteomics`` for formula mass calculat
 
 from __future__ import annotations
 
+import queue
+import threading
 import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -114,6 +116,21 @@ def _ppm_to_da(mz: float, ppm: float) -> float:
     return mz * ppm * 1e-6
 
 
+class _ExtractionCancelled(Exception):
+    """Raised internally when the user cancels a running extraction."""
+
+
+def _sum_sorted_window(mz_arr: np.ndarray, int_arr: np.ndarray, mz_lo: float, mz_hi: float) -> float:
+    """Sum intensities in a sorted m/z half-open index window."""
+    if mz_arr.size == 0:
+        return 0.0
+    lo = int(np.searchsorted(mz_arr, mz_lo, side="left"))
+    hi = int(np.searchsorted(mz_arr, mz_hi, side="right"))
+    if hi <= lo:
+        return 0.0
+    return float(int_arr[lo:hi].sum())
+
+
 def _extract_xic_from_ms1(
     reader: WiffReader,
     sample_index: int,
@@ -123,6 +140,7 @@ def _extract_xic_from_ms1(
     rt_start: float | None = None,
     rt_end: float | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Chromatogram | None:
     """Extract an XIC by summing intensities in the m/z window for every MS1 cycle."""
     mz_lo = target_mz - mz_tolerance_da
@@ -142,6 +160,8 @@ def _extract_xic_from_ms1(
     total = len(cycle_times)
 
     for cycle in range(total):
+        if cancel_event is not None and cancel_event.is_set():
+            raise _ExtractionCancelled
         t = cycle_times[cycle]
         if rt_start is not None and t < rt_start:
             continue
@@ -156,10 +176,7 @@ def _extract_xic_from_ms1(
             continue
         mz_arr = np.asarray(spec.mz)
         int_arr = np.asarray(spec.intensities)
-        if mz_arr.size == 0:
-            total_int = 0.0
-        else:
-            total_int = float(int_arr[(mz_arr >= mz_lo) & (mz_arr <= mz_hi)].sum())
+        total_int = _sum_sorted_window(mz_arr, int_arr, mz_lo, mz_hi)
         times.append(t)
         intensities.append(total_int)
         if progress_cb is not None:
@@ -185,12 +202,23 @@ class _MsMsMatch:
     tic_50_parent: float  # total ion current in [50, precursor_mz]
 
 
+@dataclass
+class _ExtractionResult:
+    """Completed XIC extraction and MS/MS match payload."""
+    xic: Chromatogram | None
+    msms_matches: list[_MsMsMatch]
+    target_mz: float
+    tol_da: float
+    ms1_idx: int
+
+
 def _find_matching_msms(
     reader: WiffReader,
     sample_index: int,
     experiments: list[ExperimentInfo],
     target_mz: float,
     tol_da: float,
+    cancel_event: threading.Event | None = None,
 ) -> list[_MsMsMatch]:
     """Find all MS/MS spectra whose precursor m/z falls within the window."""
     mz_lo = target_mz - tol_da
@@ -203,15 +231,16 @@ def _find_matching_msms(
         # Prefetch scan-item metadata in one batch (avoids per-cycle SQLite queries)
         try:
             reader.prefetch_experiment(sample_index, exp.index)
-            times = reader.get_cycle_times(sample_index, exp.index)
         except Exception:
             continue
-        for ci in range(min(len(times), exp.cycle_count)):
-            try:
-                meta = reader.get_spectrum_metadata(sample_index, exp.index, ci)
-            except Exception:
+        for ci in range(exp.cycle_count):
+            if cancel_event is not None and cancel_event.is_set():
+                raise _ExtractionCancelled
+            row = reader._prefetch_cache.get((sample_index, exp.index, ci))
+            if row is None:
                 continue
-            if meta.precursor_mz is not None and mz_lo <= meta.precursor_mz <= mz_hi:
+            precursor_mz = reader._precursor_mz(row)
+            if precursor_mz is not None and mz_lo <= precursor_mz <= mz_hi:
                 # Compute TIC in [50, precursor_mz] range
                 tic = 0.0
                 try:
@@ -221,15 +250,14 @@ def _find_matching_msms(
                     )
                     mz_arr = np.asarray(spec.mz)
                     int_arr = np.asarray(spec.intensities)
-                    mask = (mz_arr >= 50.0) & (mz_arr <= meta.precursor_mz)
-                    tic = float(int_arr[mask].sum()) if mask.any() else 0.0
+                    tic = _sum_sorted_window(mz_arr, int_arr, 50.0, precursor_mz)
                 except Exception:
                     pass
                 matches.append(_MsMsMatch(
                     experiment_index=exp.index,
                     cycle_index=ci,
-                    scan_time=meta.scan_time,
-                    precursor_mz=meta.precursor_mz,
+                    scan_time=float(row["retentionTime"]),
+                    precursor_mz=precursor_mz,
                     tic_50_parent=tic,
                 ))
     # Sort by retention time (ascending)
@@ -251,6 +279,7 @@ class WiffGuiApp(tk.Tk):
 
         # ── state ──
         self._reader: WiffReader | None = None
+        self._current_path: Path | None = None
         self._file_label_var = tk.StringVar(value="No file opened")
         self._samples: list[SampleInfo] = []
         self._experiments: list[ExperimentInfo] = []
@@ -262,7 +291,9 @@ class WiffGuiApp(tk.Tk):
         self._current_formula: str = ""
         self._current_adduct: str = "H+"
         self._xic_click_cid: int | None = None  # matplotlib event connection id
-        self._extraction_cancelled = False
+        self._extraction_queue: queue.Queue[tuple[str, Any]] | None = None
+        self._extraction_thread: threading.Thread | None = None
+        self._extraction_cancel_event: threading.Event | None = None
 
         # ── build UI ──
         self._build_menu()
@@ -510,18 +541,22 @@ class WiffGuiApp(tk.Tk):
             self._set_status("Ready")
             return
 
+        self._current_path = path
         self._file_label_var.set(path.name)
         self._samples = self._reader.list_samples()
         self._populate_samples()
         self._set_status(f"Opened {path.name} — {len(self._samples)} sample(s)")
 
     def _close_reader(self) -> None:
+        if self._extraction_cancel_event is not None:
+            self._extraction_cancel_event.set()
         if self._reader is not None:
             try:
                 self._reader.close()
             except Exception:
                 pass
             self._reader = None
+        self._current_path = None
         self._samples = []
         self._experiments = []
         self._current_xic = None
@@ -610,7 +645,10 @@ class WiffGuiApp(tk.Tk):
 
     # ── XIC extraction + auto MS/MS matching ──────────────────────────────
     def _extract_xic(self) -> None:
-        if self._reader is None:
+        if self._reader is None or self._current_path is None:
+            return
+
+        if self._extraction_thread is not None and self._extraction_thread.is_alive():
             return
 
         ms1 = self._get_ms1_experiment()
@@ -635,91 +673,149 @@ class WiffGuiApp(tk.Tk):
 
         tol_da = _ppm_to_da(target_mz, tol_ppm)
 
-        self._extraction_cancelled = False
+        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        cancel_event = threading.Event()
+        self._extraction_queue = result_queue
+        self._extraction_cancel_event = cancel_event
         self._extract_btn.config(state=tk.DISABLED)
         self._cancel_btn.config(state=tk.NORMAL)
-        self._progress.config(value=0)
+        self._progress.config(maximum=100, value=0)
         self._set_status(f"Extracting XIC: m/z {target_mz:.4f} ± {tol_da:.4f} Da…")
 
-        def _progress_cb(current: int, total: int) -> None:
-            if self._extraction_cancelled:
-                return
-            self._progress.config(maximum=total, value=current)
-            self.update_idletasks()
+        worker_args = (
+            self._current_path,
+            self._current_sample_idx,
+            list(self._experiments),
+            ms1.index,
+            target_mz,
+            tol_da,
+            result_queue,
+            cancel_event,
+        )
+        self._extraction_thread = threading.Thread(
+            target=self._run_extraction_worker,
+            args=worker_args,
+            daemon=True,
+        )
+        self._extraction_thread.start()
+        self.after(50, self._poll_extraction_queue)
 
-        self.after(50, lambda: self._do_extract_and_match(
-            ms1.index, target_mz, tol_da, _progress_cb,
-        ))
-
-    def _do_extract_and_match(
-        self, ms1_idx: int, target_mz: float, tol_da: float,
-        progress_cb: Callable[[int, int], None],
+    @staticmethod
+    def _run_extraction_worker(
+        path: Path,
+        sample_idx: int,
+        experiments: list[ExperimentInfo],
+        ms1_idx: int,
+        target_mz: float,
+        tol_da: float,
+        result_queue: queue.Queue[tuple[str, Any]],
+        cancel_event: threading.Event,
     ) -> None:
-        # ── Step 1: extract XIC ──
         try:
-            xic = _extract_xic_from_ms1(
-                self._reader,  # type: ignore[arg-type]
-                self._current_sample_idx,
-                ms1_idx,
-                target_mz,
-                tol_da,
-                progress_cb=progress_cb,
-            )
+            def _progress_cb(current: int, total: int) -> None:
+                result_queue.put(("progress", (current, total)))
+
+            with WiffReader(path) as reader:
+                xic = _extract_xic_from_ms1(
+                    reader,
+                    sample_idx,
+                    ms1_idx,
+                    target_mz,
+                    tol_da,
+                    progress_cb=_progress_cb,
+                    cancel_event=cancel_event,
+                )
+                result_queue.put(("status", "Finding matching MS/MS spectra…"))
+                msms_matches = _find_matching_msms(
+                    reader,
+                    sample_idx,
+                    experiments,
+                    target_mz,
+                    tol_da,
+                    cancel_event=cancel_event,
+                )
+            result_queue.put(("result", _ExtractionResult(
+                xic=xic,
+                msms_matches=msms_matches,
+                target_mz=target_mz,
+                tol_da=tol_da,
+                ms1_idx=ms1_idx,
+            )))
+        except _ExtractionCancelled:
+            result_queue.put(("cancelled", None))
         except Exception as exc:
-            self._finish_extraction()
-            messagebox.showerror("Error", f"XIC extraction failed:\n{exc}")
+            result_queue.put(("error", str(exc)))
+
+    def _poll_extraction_queue(self) -> None:
+        if self._extraction_queue is None:
             return
+        keep_polling = True
+        while True:
+            try:
+                kind, payload = self._extraction_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                current, total = payload
+                self._progress.config(maximum=total, value=current)
+            elif kind == "status":
+                self._set_status(str(payload))
+            elif kind == "result":
+                self._finish_extraction()
+                self._handle_extraction_result(payload)
+                keep_polling = False
+            elif kind == "cancelled":
+                self._finish_extraction()
+                self._set_status("Extraction cancelled.")
+                keep_polling = False
+            elif kind == "error":
+                self._finish_extraction()
+                messagebox.showerror("Error", f"XIC extraction failed:\n{payload}")
+                keep_polling = False
 
-        # ── Step 2: find matching MS/MS spectra ──
-        msms_matches: list[_MsMsMatch] = []
-        try:
-            msms_matches = _find_matching_msms(
-                self._reader,  # type: ignore[arg-type]
-                self._current_sample_idx,
-                self._experiments,
-                target_mz,
-                tol_da,
-            )
-        except Exception:
-            pass  # non-fatal — still show the XIC
+        if keep_polling:
+            self.after(50, self._poll_extraction_queue)
 
-        self._finish_extraction()
-
+    def _handle_extraction_result(self, result: _ExtractionResult) -> None:
         # ── Display XIC ──
-        if xic is None or not xic.times:
+        if result.xic is None or not result.xic.times:
             messagebox.showinfo("No data", "No intensities found in the specified m/z window.")
             return
 
-        self._current_xic = xic
-        self._current_target_mz = target_mz
-        self._current_ms1_idx = ms1_idx
-        self._plot_xic(xic, target_mz, tol_da)
+        self._current_xic = result.xic
+        self._current_target_mz = result.target_mz
+        self._current_ms1_idx = result.ms1_idx
+        self._plot_xic(result.xic, result.target_mz, result.tol_da)
 
         # ── Populate MS/MS match list ──
-        self._populate_msms_matches(msms_matches)
+        self._populate_msms_matches(result.msms_matches)
 
         # ── Auto-select first MS/MS match if any ──
-        if msms_matches:
+        if result.msms_matches:
             first = self._msms_tree.get_children()[0]
             self._msms_tree.selection_set(first)
             self._on_msms_selected()
 
         msg = (
-            f"XIC: m/z {target_mz:.4f} ± {tol_da:.4f} Da — "
-            f"{len(xic.times)} points, max={max(xic.intensities):.0f}"
+            f"XIC: m/z {result.target_mz:.4f} ± {result.tol_da:.4f} Da — "
+            f"{len(result.xic.times)} points, max={max(result.xic.intensities):.0f}"
         )
-        if msms_matches:
-            msg += f" | {len(msms_matches)} MS/MS match(es)"
+        if result.msms_matches:
+            msg += f" | {len(result.msms_matches)} MS/MS match(es)"
         self._set_status(msg)
 
     def _cancel_extraction(self) -> None:
-        self._extraction_cancelled = True
-        self._finish_extraction()
-        self._set_status("Extraction cancelled.")
+        if self._extraction_cancel_event is not None:
+            self._extraction_cancel_event.set()
+        self._cancel_btn.config(state=tk.DISABLED)
+        self._set_status("Cancelling extraction…")
 
     def _finish_extraction(self) -> None:
         self._extract_btn.config(state=tk.NORMAL)
         self._cancel_btn.config(state=tk.DISABLED)
+        self._extraction_cancel_event = None
+        self._extraction_queue = None
+        self._extraction_thread = None
 
     # ── XIC plotting ──────────────────────────────────────────────────────
     def _plot_xic(self, xic: Chromatogram, target_mz: float, tol_da: float) -> None:
@@ -816,13 +912,7 @@ class WiffGuiApp(tk.Tk):
         else:
             rel = np.zeros_like(intensities)
 
-        # Bar chart
-        if len(mz) > 1:
-            bar_width = max((mz[-1] - mz[0]) * 0.001, 0.0005)
-        else:
-            bar_width = 0.01
-        self._iso_ax.bar(mz, rel, width=bar_width, color="#2ca02c",
-                         edgecolor="#2ca02c", linewidth=0)
+        self._iso_ax.vlines(mz, 0, rel, color="#2ca02c", linewidth=0.8)
 
         self._iso_ax.set_xlabel("m/z")
         self._iso_ax.set_ylabel("Rel. Abundance (%)")
@@ -940,13 +1030,7 @@ class WiffGuiApp(tk.Tk):
         intensities = intensities_all[mask]
 
         if len(mz) > 0:
-            # Bar chart (stick spectrum).  Use a small relative bar width.
-            if len(mz) > 1:
-                bar_width = max((mz[-1] - mz[0]) * 0.001, 0.0001)
-            else:
-                bar_width = 0.01
-            self._msms_ax.bar(mz, intensities, width=bar_width, color="#d62728",
-                              edgecolor="#d62728", linewidth=0)
+            self._msms_ax.vlines(mz, 0, intensities, color="#d62728", linewidth=0.7)
 
         self._msms_ax.set_xlabel("m/z")
         self._msms_ax.set_ylabel("Intensity")

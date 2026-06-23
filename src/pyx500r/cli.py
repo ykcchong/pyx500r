@@ -45,7 +45,6 @@ def _resolve_paths(raw: Sequence[str]) -> list[Path]:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pyx500r",
         description="Read WIFF2 files, centroid spectra, query precursor-product ion pairs.",
     )
     sub = parser.add_subparsers(dest="command", required=True)

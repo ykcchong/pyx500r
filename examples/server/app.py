@@ -5,8 +5,7 @@ A minimal but production-shaped API for a TypeScript GUI that browses
 
 Run::
 
-    pip install -e ".[numba]"
-    pip install -r examples/server/requirements.txt
+    pip install -e ".[server]"
     export PYX500R_DATA_ROOT=./data        # directory containing your files
     uvicorn examples.server.app:app --reload --port 8000
 
@@ -33,7 +32,7 @@ try:
 except ImportError as exc:  # pragma: no cover - dependency hint
     raise SystemExit(
         "FastAPI is not installed. Run:\n"
-        "    pip install -r examples/server/requirements.txt"
+        "    pip install -e \".[server]\""
     ) from exc
 
 from pyx500r import WiffQSessionBridge

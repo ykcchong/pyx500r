@@ -1,16 +1,16 @@
-"""Search a precomputed MS2 product-ion index (built by ``pyx500r-index``).
+"""Search a precomputed MS2 product-ion index (built by ``x500rindex``).
 
 Two modes:
 
 1. **TUI** (default when no query flags given): interactive REPL::
 
-       w2searcher index.npz
+       x500rsearch index.npz
 
 2. **CLI** (with query flags): one-shot search, same interface as
-   ``pyx500r transitions``::
+   ``x500r transitions``::
 
-       w2searcher index.npz --precursor-mz 456.2 --tolerance-ppm 20
-       w2searcher index.npz -t "250.1587:191.0857,163.0907" --json
+       x500rsearch index.npz --precursor-mz 456.2 --tolerance-ppm 20
+       x500rsearch index.npz -t "250.1587:191.0857,163.0907" --json
 
 TUI commands::
 
@@ -595,7 +595,7 @@ def _print_transition_table(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="w2searcher")
+    p = argparse.ArgumentParser()
     p.add_argument("index", help="Path to the .npz index file")
     p.add_argument("--precursor-mz", type=float, default=None)
     p.add_argument("--tolerance-ppm", type=float, default=50.0)

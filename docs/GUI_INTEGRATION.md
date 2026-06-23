@@ -42,7 +42,7 @@ Key principles:
 ```
 examples/server/
 ├── README.md
-├── requirements.txt        # fastapi, uvicorn[standard], pyx500r[numba]
+├── requirements.txt        # fastapi, uvicorn[standard]
 ├── app.py                  # FastAPI app + endpoints
 ├── pool.py                 # path-keyed reader pool (thread-safe)
 └── serializers.py          # dataclass / UnifiedPeak → JSON-native dict
@@ -51,8 +51,7 @@ examples/server/
 Install and run:
 
 ```bash
-pip install -e ".[numba]"
-pip install -r examples/server/requirements.txt
+pip install -e ".[server]"
 uvicorn examples.server.app:app --reload --port 8000
 # Interactive docs at http://localhost:8000/docs
 ```
@@ -441,7 +440,7 @@ Plotting tips:
 - [ ] Centroid/downsample large spectra; offer the binary endpoint for raw data.
 - [ ] Lock down file paths to a data root; never trust client paths.
 - [ ] Add response caching (e.g. `Cache-Control`) — spectra/TICs are immutable.
-- [ ] Install the `[numba]` extra in the server image for fast decode.
+- [ ] Install the base package in the server image; `numba` is included for fast decode.
 - [ ] Pre-warm numba JIT at startup (import `pyx500r.tof` triggers warm-up) so
       the first request isn't slow.
 

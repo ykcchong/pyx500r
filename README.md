@@ -18,9 +18,13 @@ Works on macOS, Linux and Windows.
 ## Installation
 
 ```bash
+conda create -n pyx500r python=3.12 pip
+conda activate pyx500r
+
 pip install -e .            # core reader (cryptography + numba + numpy + nrbf)
 pip install -e .[cli]       # + tqdm progress bars
 pip install -e .[server]    # + FastAPI/Uvicorn for the example web apps
+pip install -e .[gui]       # + matplotlib/pyteomics for the Tk GUI
 pip install -e .[dev]       # + pytest
 ```
 
@@ -78,14 +82,15 @@ with WiffQSessionBridge("quant_results.qsession",
 
 ## Command-line tools
 
-| Command | Purpose |
-|---------|---------|
-| `pyx500r` | List samples / find precursor→product transitions |
-| `ppyx500r` | Same, multiprocess (`-j N`) |
-| `pyx500r-index` | Build an `.npz` MS2 product-ion index |
-| `pyx500r-search` | Query an `.npz` index (TUI + one-shot) |
-| `pyx500r-qsession` | Interactive qsession results explorer |
-| `pyx500r-libsearch` | Search MGF/peaks against a LibraryView DB |
+| Command | Compatibility alias | Purpose |
+|---------|---------------------|---------|
+| `x500r` | `pyx500r` | List samples / find precursor→product transitions |
+| `x500rp` | `ppyx500r` | Same, multiprocess (`-j N`) |
+| `x500rindex` | `pyx500r-index` | Build an `.npz` MS2 product-ion index |
+| `x500rsearch` | `pyx500r-search` | Query an `.npz` index (TUI + one-shot) |
+| `x500rqsession` | `pyx500r-qsession` | Interactive qsession results explorer |
+| `x500rlibsearch` | `pyx500r-libsearch` | Search MGF/peaks against a LibraryView DB |
+| `x500rgui` | `pyx500r-gui` | Launch the native WIFF browser GUI |
 
 ## Running tests
 

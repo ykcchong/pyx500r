@@ -32,6 +32,9 @@ dependencies = [
 
 # ── optional extras ──
 [project.optional-dependencies]
+# Backward-compatible alias for older docs and install commands.
+numba = []
+
 # CLI progress bars
 cli = [
     "tqdm>=4.64.0",
@@ -51,9 +54,11 @@ gui = [
 
 # Backward-compatible alias (numba and numpy are base dependencies)
 all = [
-    "numba>=0.58.0",
-    "numpy>=1.24.0",
     "tqdm>=4.64.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "matplotlib>=3.7.0",
+    "pyteomics>=4.7",
 ]
 
 # Development / testing
@@ -64,6 +69,13 @@ dev = [
 
 
 [project.scripts]
+x500r = "pyx500r.cli:main"
+x500rp = "pyx500r.cli_parallel:main"
+x500rqsession = "pyx500r.cli_bridge:main"
+x500rindex = "pyx500r.index_builder:main"
+x500rlibsearch = "pyx500r.libsearch_cli:main"
+x500rsearch = "pyx500r.w2searcher:main"
+x500rgui = "pyx500r.wiff_gui:main"
 pyx500r = "pyx500r.cli:main"
 ppyx500r = "pyx500r.cli_parallel:main"
 pyx500r-qsession = "pyx500r.cli_bridge:main"
