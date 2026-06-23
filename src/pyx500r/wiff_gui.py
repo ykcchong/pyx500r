@@ -21,6 +21,8 @@ Dependencies: ``matplotlib``.  Optional: ``pyteomics`` for formula mass calculat
 
 from __future__ import annotations
 
+import csv
+import json
 import queue
 import threading
 import tkinter as tk
@@ -57,6 +59,11 @@ _ADDUCTS = {
     "Na+":    {"formula": "Na+",   "charge": 1},
     "NH4+":   {"formula": "NH4+",  "charge": 1},
 }
+
+_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+_SPECTRA_DIR = _DATA_DIR / "spectra"
+_DEFAULT_CSV_LIBRARY = _SPECTRA_DIR / "highresnps april 2026 shimadzu.csv"
+_DEFAULT_JSON_LIBRARY = _DATA_DIR / "library.json"
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -145,7 +152,17 @@ def _remove_artists(artists: list[Any]) -> None:
             pass
 
 
-def _label_bbox(ax: Any, x: float, y: float, text: str, fontsize: float, rotation: float) -> Bbox:
+def _label_bbox(
+    ax: Any,
+    x: float,
+    y: float,
+    text: str,
+    fontsize: float,
+    rotation: float,
+    *,
+    ha: str = "center",
+    va: str = "bottom",
+) -> Bbox:
     """Estimate a text label bbox in display pixels for collision checks."""
     x_px, y_px = ax.transData.transform((x, y))
     dpi_scale = ax.figure.dpi / 72.0
@@ -157,7 +174,22 @@ def _label_bbox(ax: Any, x: float, y: float, text: str, fontsize: float, rotatio
     else:
         width = max(char_w * len(text), char_h)
         height = char_h * 1.4
-    return Bbox.from_bounds(x_px - width / 2, y_px, width, height)
+
+    if ha == "left":
+        x0 = x_px
+    elif ha == "right":
+        x0 = x_px - width
+    else:
+        x0 = x_px - width / 2
+
+    if va == "center":
+        y0 = y_px - height / 2
+    elif va == "top":
+        y0 = y_px - height
+    else:
+        y0 = y_px
+
+    return Bbox.from_bounds(x0, y0, width, height)
 
 
 def _place_peak_labels(
@@ -198,21 +230,34 @@ def _place_peak_labels(
     for idx in candidates:
         label = label_for(idx)
         x = float(mz[idx])
-        y_text = min(float(y[idx]) + y_pad, y_hi - y_pad)
-        bbox = _label_bbox(ax, x, y_text, label, fontsize, rotation)
-        if not axes_bbox.contains(bbox.x0, bbox.y0) or not axes_bbox.contains(bbox.x1, bbox.y1):
-            continue
-        padded = bbox.padded(2)
-        if any(padded.overlaps(existing) for existing in accepted):
-            continue
+        peak_y = float(y[idx])
+        y_text = min(peak_y + y_pad, y_hi - y_pad)
 
-        artist = ax.text(
-            x, y_text, label,
-            ha="center", va="bottom", fontsize=fontsize, rotation=rotation,
-            color=color, clip_on=True,
-        )
-        artists.append(artist)
-        accepted.append(padded)
+        x_px, y_px = ax.transData.transform((x, min(max(peak_y, y_lo), y_hi)))
+        right_x = ax.transData.inverted().transform((x_px + 5, y_px))[0]
+        left_x = ax.transData.inverted().transform((x_px - 5, y_px))[0]
+        attempts = [
+            (x, y_text, rotation, "center", "bottom"),
+            (right_x, min(max(peak_y, y_lo), y_hi), 0, "left", "center"),
+            (left_x, min(max(peak_y, y_lo), y_hi), 0, "right", "center"),
+        ]
+
+        for lx, ly, lrot, ha, va in attempts:
+            bbox = _label_bbox(ax, lx, ly, label, fontsize, lrot, ha=ha, va=va)
+            if not axes_bbox.contains(bbox.x0, bbox.y0) or not axes_bbox.contains(bbox.x1, bbox.y1):
+                continue
+            padded = bbox.padded(2)
+            if any(padded.overlaps(existing) for existing in accepted):
+                continue
+
+            artist = ax.text(
+                lx, ly, label,
+                ha=ha, va=va, fontsize=fontsize, rotation=lrot,
+                color=color, clip_on=True,
+            )
+            artists.append(artist)
+            accepted.append(padded)
+            break
 
     return artists
 
@@ -313,6 +358,178 @@ class _ExtractionResult:
     ms1_idx: int
 
 
+@dataclass
+class _LibraryHit:
+    """One matchms library search hit."""
+    rank: int
+    name: str
+    formula: str
+    database_id: str
+    precursor_mz: float
+    score: float
+    matches: int
+    num_peaks: int
+    mz: np.ndarray
+    intensity: np.ndarray
+
+
+def _float_or_none(value: str | None) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _csv_row_to_matchms_json(row: dict[str, str]) -> dict[str, Any] | None:
+    peaks: list[list[float]] = []
+    for idx in range(1, 8):
+        mz = _float_or_none(row.get(f"m/z {idx}"))
+        intensity = _float_or_none(row.get(f"Intensity {idx}"))
+        if mz is None or intensity is None or intensity <= 0:
+            continue
+        peaks.append([mz, intensity])
+    if not peaks:
+        return None
+    peaks.sort(key=lambda item: item[0])
+
+    precursor_mz = _float_or_none(row.get("Precursor m/z"))
+    metadata: dict[str, Any] = {
+        "compound_name": row.get("Compound Name", "").strip(),
+        "formula": row.get("Formula", "").strip(),
+        "precursor_mz": precursor_mz or 0.0,
+        "ionmode": row.get("Polarity", "").strip().lower(),
+        "adduct": row.get("Precursor Ion", "").strip(),
+        "smiles": row.get("SMILES", "").strip(),
+        "inchi": row.get("InChI", "").strip(),
+        "database_id": row.get("Comment", "").strip(),
+        "compound_class": row.get("Class", "").strip(),
+        "theory_mw": _float_or_none(row.get("Theory MW")) or 0.0,
+        "retention_time": _float_or_none(row.get("RT")) or 0.0,
+        "collision_gas_voltage": _float_or_none(row.get("Collision Gas Vol.")) or 0.0,
+        "peaks_json": peaks,
+    }
+    if row.get("CAS #"):
+        metadata["cas"] = row["CAS #"].strip()
+    return metadata
+
+
+def _convert_csv_to_matchms_json(csv_path: Path, json_path: Path) -> int:
+    """Convert the Shimadzu CSV library into MatchMS JSON."""
+    spectra: list[dict[str, Any]] = []
+    with csv_path.open("r", newline="", encoding="utf-8-sig", errors="replace") as handle:
+        for row in csv.DictReader(handle):
+            item = _csv_row_to_matchms_json(row)
+            if item is not None:
+                spectra.append(item)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(spectra, handle, ensure_ascii=False, separators=(",", ":"))
+    return len(spectra)
+
+
+def _ensure_matchms_json_library(csv_path: Path, json_path: Path) -> None:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV library not found: {csv_path}")
+    if (
+        not json_path.exists()
+        or json_path.stat().st_mtime < csv_path.stat().st_mtime
+    ):
+        _convert_csv_to_matchms_json(csv_path, json_path)
+
+
+def _load_matchms_json_library(path: Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    library: list[dict[str, Any]] = []
+    for item in raw:
+        peaks = item.get("peaks_json", [])
+        if not peaks:
+            continue
+        mz = np.array([float(p[0]) for p in peaks], dtype=np.float64)
+        intensity = np.array([float(p[1]) for p in peaks], dtype=np.float64)
+        library.append({
+            "name": str(item.get("compound_name") or item.get("name") or ""),
+            "formula": str(item.get("formula") or ""),
+            "database_id": str(item.get("database_id") or ""),
+            "precursor_mz": float(item.get("precursor_mz") or 0.0),
+            "ionmode": str(item.get("ionmode") or ""),
+            "mz": mz,
+            "intensity": intensity,
+            "num_peaks": int(len(mz)),
+        })
+    return library
+
+
+def _search_json_library_with_matchms(
+    query_mz: np.ndarray,
+    query_intensity: np.ndarray,
+    library: list[dict[str, Any]],
+    *,
+    precursor_mz: float | None = None,
+    precursor_ppm: float = 50.0,
+    tolerance_da: float = 0.02,
+    top_n: int = 10,
+) -> list[_LibraryHit]:
+    """Search a centroided MS/MS peak list against MatchMS JSON library entries."""
+    try:
+        from matchms import Spectrum
+        from matchms.similarity import CosineGreedy
+    except ImportError as exc:
+        raise RuntimeError("matchms is not installed. Install with: pip install -e '.[gui]'") from exc
+
+    if query_mz.size == 0 or query_intensity.size == 0:
+        return []
+
+    query = Spectrum(
+        mz=np.asarray(query_mz, dtype=np.float64),
+        intensities=np.asarray(query_intensity, dtype=np.float64),
+        metadata={"precursor_mz": 0.0},
+    )
+    similarity = CosineGreedy(tolerance=tolerance_da)
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+
+    for entry in library:
+        ref_precursor = float(entry.get("precursor_mz") or 0.0)
+        if precursor_mz and ref_precursor > 0:
+            tol = precursor_mz * precursor_ppm * 1e-6
+            if abs(ref_precursor - precursor_mz) > tol:
+                continue
+        ref = Spectrum(
+            mz=entry["mz"],
+            intensities=entry["intensity"],
+            metadata={
+                "compound_name": entry.get("name", ""),
+                "formula": entry.get("formula", ""),
+                "database_id": entry.get("database_id", ""),
+                "precursor_mz": 0.0,
+            },
+        )
+        pair = similarity.pair(query, ref)
+        score = float(pair["score"])
+        matches = int(pair["matches"])
+        if score > 0 and matches > 0:
+            scored.append((score, matches, entry))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    hits: list[_LibraryHit] = []
+    for rank, (score, matches, entry) in enumerate(scored[:top_n], start=1):
+        hits.append(_LibraryHit(
+            rank=rank,
+            name=str(entry.get("name", "")),
+            formula=str(entry.get("formula", "")),
+            database_id=str(entry.get("database_id", "")),
+            precursor_mz=float(entry.get("precursor_mz") or 0.0),
+            score=score,
+            matches=matches,
+            num_peaks=int(entry.get("num_peaks", len(entry.get("mz", [])))),
+            mz=np.asarray(entry.get("mz", []), dtype=np.float64),
+            intensity=np.asarray(entry.get("intensity", []), dtype=np.float64),
+        ))
+    return hits
+
+
 def _find_matching_msms(
     reader: WiffReader,
     sample_index: int,
@@ -403,6 +620,11 @@ class WiffGuiApp(tk.Tk):
         self._extraction_queue: queue.Queue[tuple[str, Any]] | None = None
         self._extraction_thread: threading.Thread | None = None
         self._extraction_cancel_event: threading.Event | None = None
+        self._library_queue: queue.Queue[tuple[str, Any]] | None = None
+        self._library_thread: threading.Thread | None = None
+        self._json_library_cache: list[dict[str, Any]] | None = None
+        self._library_hits_by_iid: dict[str, _LibraryHit] = {}
+        self._current_library_hit: _LibraryHit | None = None
 
         # ── build UI ──
         self._build_menu()
@@ -537,6 +759,34 @@ class WiffGuiApp(tk.Tk):
         self._msms_tree.pack(fill=tk.BOTH, expand=True)
         self._msms_tree.bind("<<TreeviewSelect>>", self._on_msms_selected)
 
+        lib_frame = ttk.LabelFrame(parent, text="HighResNPS Library Search", padding=4)
+        lib_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 4))
+
+        lib_row = ttk.Frame(lib_frame)
+        lib_row.pack(fill=tk.X, pady=(0, 4))
+        self._library_btn = ttk.Button(
+            lib_row, text="Search HighResNPS JSON",
+            command=self._search_current_msms_library, state=tk.DISABLED,
+        )
+        self._library_btn.pack(side=tk.LEFT)
+
+        self._library_tree = ttk.Treeview(
+            lib_frame, columns=("score", "matches", "precursor", "formula"),
+            show="tree headings", selectmode="browse", height=7,
+        )
+        self._library_tree.heading("#0", text="Hit")
+        self._library_tree.heading("score", text="Score")
+        self._library_tree.heading("matches", text="Peaks")
+        self._library_tree.heading("precursor", text="Prec.")
+        self._library_tree.heading("formula", text="Formula")
+        self._library_tree.column("#0", width=130, minwidth=110)
+        self._library_tree.column("score", width=55, anchor=tk.CENTER)
+        self._library_tree.column("matches", width=45, anchor=tk.CENTER)
+        self._library_tree.column("precursor", width=70, anchor=tk.CENTER)
+        self._library_tree.column("formula", width=75, anchor=tk.CENTER)
+        self._library_tree.pack(fill=tk.BOTH, expand=True)
+        self._library_tree.bind("<<TreeviewSelect>>", self._on_library_hit_selected)
+
     # ── right panel (vertical stack: XIC top, MS/MS bottom) ───────────────
     def _build_right_panel(self, parent: ttk.Frame) -> None:
         # Split the right panel vertically with a PanedWindow
@@ -567,7 +817,7 @@ class WiffGuiApp(tk.Tk):
         self._xic_toolbar.update()
 
         # Isotope pattern at clicked RT (30%)
-        iso_frame = ttk.LabelFrame(xic_hpane, text="Isotope @ clicked RT", padding=2)
+        iso_frame = ttk.Frame(xic_hpane, padding=2)
         xic_hpane.add(iso_frame, weight=3)
 
         self._iso_fig = Figure(figsize=(3, 3.5), dpi=100)
@@ -654,6 +904,10 @@ class WiffGuiApp(tk.Tk):
         self._clear_xic_plot()
         self._clear_msms_plot()
         self._msms_tree.delete(*self._msms_tree.get_children())
+        self._library_tree.delete(*self._library_tree.get_children())
+        self._library_hits_by_iid = {}
+        self._current_library_hit = None
+        self._library_btn.config(state=tk.DISABLED)
         self._extract_btn.config(state=tk.DISABLED)
         self._file_label_var.set("No file opened")
         self._current_formula = ""
@@ -1089,14 +1343,18 @@ class WiffGuiApp(tk.Tk):
         try:
             spec = self._reader.get_spectrum(
                 self._current_sample_idx, exp_idx, cycle,
-                centroid=False, return_arrays=True,
+                centroid=True, return_arrays=True,
             )
         except Exception as exc:
             messagebox.showerror("Error", f"Failed to load spectrum:\n{exc}")
             return
 
         self._current_msms_spectrum = spec
+        self._current_library_hit = None
         self._plot_msms(spec)
+        self._library_tree.delete(*self._library_tree.get_children())
+        self._library_hits_by_iid = {}
+        self._library_btn.config(state=tk.NORMAL)
 
         # ── Auto-show isotope pattern from MS1 at this RT ────────────
         if self._current_target_mz > 0:
@@ -1106,6 +1364,117 @@ class WiffGuiApp(tk.Tk):
             f"MS/MS: exp={exp_idx}, cycle={cycle}, "
             f"RT={spec.scan_time:.2f} min, "
             f"precursor={spec.precursor_mz or '?'}, {len(spec.mz)} points"
+        )
+
+    def _search_current_msms_library(self) -> None:
+        if self._current_msms_spectrum is None:
+            messagebox.showinfo("No MS/MS selected", "Select a matching MS/MS spectrum first.")
+            return
+        if self._library_thread is not None and self._library_thread.is_alive():
+            return
+        if not _DEFAULT_CSV_LIBRARY.exists():
+            messagebox.showerror("Library not found", f"CSV file not found:\n{_DEFAULT_CSV_LIBRARY}")
+            return
+
+        spec = self._current_msms_spectrum
+        query_mz = np.asarray(spec.mz, dtype=np.float64)
+        query_intensity = np.asarray(spec.intensities, dtype=np.float64)
+        precursor_mz = float(spec.precursor_mz or 0.0)
+        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._library_queue = result_queue
+        self._library_btn.config(state=tk.DISABLED)
+        self._library_tree.delete(*self._library_tree.get_children())
+        self._set_status("Searching HighResNPS MatchMS JSON library...")
+
+        def _worker() -> None:
+            try:
+                _ensure_matchms_json_library(_DEFAULT_CSV_LIBRARY, _DEFAULT_JSON_LIBRARY)
+                if self._json_library_cache is None:
+                    library = _load_matchms_json_library(_DEFAULT_JSON_LIBRARY)
+                    self._json_library_cache = library
+                else:
+                    library = self._json_library_cache
+                hits = _search_json_library_with_matchms(
+                    query_mz,
+                    query_intensity,
+                    library,
+                    precursor_mz=precursor_mz or None,
+                    tolerance_da=0.02,
+                    top_n=10,
+                )
+                result_queue.put(("result", hits))
+            except Exception as exc:
+                result_queue.put(("error", str(exc)))
+
+        self._library_thread = threading.Thread(target=_worker, daemon=True)
+        self._library_thread.start()
+        self.after(50, self._poll_library_queue)
+
+    def _poll_library_queue(self) -> None:
+        active_queue = self._library_queue
+        if active_queue is None:
+            return
+        keep_polling = True
+        while True:
+            try:
+                kind, payload = active_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "result":
+                self._finish_library_search()
+                self._populate_library_hits(payload)
+                keep_polling = False
+            elif kind == "error":
+                self._finish_library_search()
+                messagebox.showerror("Library search failed", str(payload))
+                keep_polling = False
+
+        if keep_polling and self._library_queue is active_queue:
+            self.after(50, self._poll_library_queue)
+
+    def _finish_library_search(self) -> None:
+        self._library_queue = None
+        self._library_thread = None
+        self._library_btn.config(state=tk.NORMAL if self._current_msms_spectrum is not None else tk.DISABLED)
+
+    def _populate_library_hits(self, hits: list[_LibraryHit]) -> None:
+        self._library_tree.delete(*self._library_tree.get_children())
+        self._library_hits_by_iid = {}
+        self._current_library_hit = None
+        if not hits:
+            self._set_status("HighResNPS library search: no hits.")
+            return
+        for hit in hits:
+            display = f"{hit.rank}. {hit.name}"
+            iid = f"hit:{hit.rank}"
+            self._library_hits_by_iid[iid] = hit
+            self._library_tree.insert(
+                "", tk.END, iid=iid, text=display,
+                values=(
+                    f"{hit.score:.3f}",
+                    str(hit.matches),
+                    f"{hit.precursor_mz:.4f}" if hit.precursor_mz else "",
+                    hit.formula,
+                ),
+            )
+        best = hits[0]
+        self._set_status(
+            f"HighResNPS library search: best {best.name} "
+            f"(score={best.score:.3f}, matched peaks={best.matches}, precursor={best.precursor_mz:.4f})"
+        )
+
+    def _on_library_hit_selected(self, _event: Any = None) -> None:
+        sel = self._library_tree.selection()
+        if not sel or self._current_msms_spectrum is None:
+            return
+        hit = self._library_hits_by_iid.get(sel[0])
+        if hit is None:
+            return
+        self._current_library_hit = hit
+        self._plot_msms(self._current_msms_spectrum, library_hit=hit)
+        self._set_status(
+            f"Library comparison: {hit.name} "
+            f"(score={hit.score:.3f}, matched peaks={hit.matches})"
         )
 
     def _show_isotope_at_rt(self, rt: float) -> None:
@@ -1153,7 +1522,7 @@ class WiffGuiApp(tk.Tk):
         )
         self._msms_canvas.draw_idle()
 
-    def _plot_msms(self, spec: SpectrumData) -> None:
+    def _plot_msms(self, spec: SpectrumData, library_hit: _LibraryHit | None = None) -> None:
         self._msms_ax.clear()
         self._clear_msms_labels()
         self._msms_label_data = None
@@ -1170,25 +1539,47 @@ class WiffGuiApp(tk.Tk):
         if len(mz) > 0:
             self._msms_ax.vlines(mz, 0, intensities, color="#d62728", linewidth=0.7)
 
+        lib_mz = np.array([], dtype=np.float64)
+        lib_intensities = np.array([], dtype=np.float64)
+        if library_hit is not None and library_hit.mz.size and library_hit.intensity.size:
+            lib_mask = (library_hit.mz >= 50.0) & (library_hit.mz <= mz_hi_data)
+            lib_mz = library_hit.mz[lib_mask]
+            lib_intensities = library_hit.intensity[lib_mask]
+            if lib_intensities.size:
+                lib_max = float(np.nanmax(lib_intensities))
+                if lib_max > 0:
+                    scale_to = float(np.nanmax(intensities)) if len(intensities) else lib_max
+                    lib_plot = -(lib_intensities / lib_max * scale_to)
+                    self._msms_ax.vlines(
+                        lib_mz, 0, lib_plot,
+                        color="#1f77b4", linewidth=0.8, alpha=0.85,
+                    )
+
         self._msms_ax.set_xlabel("m/z")
         self._msms_ax.set_ylabel("")
 
         # Fixed x-axis for uniform display: 50 to precursor+10
         x_hi = max(precursor + 10.0, 60.0)
         self._msms_ax.set_xlim(50.0, x_hi)
+        y_max = 0.0
         if len(intensities) > 0:
             y_max = float(np.nanmax(intensities))
             if y_max > 0:
-                self._msms_ax.set_ylim(0, y_max * 1.18)
+                y_bottom = -y_max * 1.12 if library_hit is not None and lib_intensities.size else 0
+                self._msms_ax.set_ylim(y_bottom, y_max * 1.18)
                 rel_pct = intensities / y_max * 100.0
                 self._msms_label_data = (mz, intensities, rel_pct)
 
         title = f"MS/MS Spectrum — RT={spec.scan_time:.2f} min"
         if spec.precursor_mz:
             title += f", precursor m/z={spec.precursor_mz:.4f}"
+        if library_hit is not None:
+            title += f" | library: {library_hit.name[:36]}"
         self._msms_ax.set_title(title)
+        if library_hit is not None and lib_intensities.size and y_max > 0:
+            self._msms_ax.axhline(0, color="#444444", linewidth=0.6)
         self._msms_ax.xaxis.set_major_locator(MaxNLocator(nbins=12))
-        self._msms_ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: _compact_sci(v)))
+        self._msms_ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: _compact_sci(abs(v))))
         _style_dense_axes(self._msms_ax)
         self._msms_fig.subplots_adjust(left=0.045, right=0.992, bottom=0.11, top=0.9)
         if self._msms_xlim_cid is None:
