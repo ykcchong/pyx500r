@@ -25,9 +25,12 @@ classifiers = [
 # ── base install (numba JIT is required) ──
 dependencies = [
     "cryptography>=41.0.0",
+    "matchms>=0.33",
+    "matplotlib>=3.7.0",
     "numba>=0.58.0",
     "numpy>=1.24.0",
     "nrbf>=0.1.0",
+    "pyteomics>=4.7",
 ]
 
 # ── optional extras ──
@@ -46,21 +49,11 @@ server = [
     "uvicorn[standard]>=0.27",
 ]
 
-# Native GUI (Tkinter + matplotlib)
-gui = [
-    "matchms>=0.33",
-    "matplotlib>=3.7.0",
-    "pyteomics>=4.7",
-]
-
 # Backward-compatible alias (numba and numpy are base dependencies)
 all = [
     "tqdm>=4.64.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    "matchms>=0.33",
-    "matplotlib>=3.7.0",
-    "pyteomics>=4.7",
 ]
 
 # Development / testing
