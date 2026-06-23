@@ -63,7 +63,20 @@ _ADDUCTS = {
 _DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 _SPECTRA_DIR = _DATA_DIR / "spectra"
 _DEFAULT_CSV_LIBRARY = _SPECTRA_DIR / "highresnps april 2026 shimadzu.csv"
-_DEFAULT_JSON_LIBRARY = _DATA_DIR / "library.json"
+
+
+def _resolve_json_library() -> Path:
+    """Find library.json in cwd, cwd/data, or the project data dir."""
+    candidates = [
+        Path.cwd() / "library.json",
+        Path.cwd() / "data" / "library.json",
+        _DATA_DIR / "library.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    # Return the project default (for writing/conversion) even if it doesn't exist yet
+    return _DATA_DIR / "library.json"
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -1372,8 +1385,14 @@ class WiffGuiApp(tk.Tk):
             return
         if self._library_thread is not None and self._library_thread.is_alive():
             return
-        if not _DEFAULT_CSV_LIBRARY.exists():
-            messagebox.showerror("Library not found", f"CSV file not found:\n{_DEFAULT_CSV_LIBRARY}")
+
+        json_path = _resolve_json_library()
+        if not json_path.exists() and not _DEFAULT_CSV_LIBRARY.exists():
+            messagebox.showerror(
+                "Library not found",
+                f"No library.json found in cwd, cwd/data, or project data dir,\n"
+                f"and no CSV library at:\n{_DEFAULT_CSV_LIBRARY}",
+            )
             return
 
         spec = self._current_msms_spectrum
@@ -1388,9 +1407,13 @@ class WiffGuiApp(tk.Tk):
 
         def _worker() -> None:
             try:
-                _ensure_matchms_json_library(_DEFAULT_CSV_LIBRARY, _DEFAULT_JSON_LIBRARY)
+                json_path_local = _resolve_json_library()
+                if not json_path_local.exists() and _DEFAULT_CSV_LIBRARY.exists():
+                    _ensure_matchms_json_library(_DEFAULT_CSV_LIBRARY, json_path_local)
+                elif not json_path_local.exists():
+                    raise FileNotFoundError(f"No library found: {json_path_local}")
                 if self._json_library_cache is None:
-                    library = _load_matchms_json_library(_DEFAULT_JSON_LIBRARY)
+                    library = _load_matchms_json_library(json_path_local)
                     self._json_library_cache = library
                 else:
                     library = self._json_library_cache
