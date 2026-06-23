@@ -97,3 +97,5 @@ proprietary/
 
 # Backup from refactoring
 src_backup/
+examples/
+docs/
