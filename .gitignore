@@ -92,10 +92,7 @@ data/
 libview*.sqlite
 *.libdb
 
-# Proprietary / vendor assets (moved out of tree)
-proprietary/
 
 # Backup from refactoring
 src_backup/
 examples/
-docs/

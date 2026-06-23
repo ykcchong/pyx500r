@@ -37,6 +37,8 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+from matplotlib.transforms import Bbox
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 from pyx500r.reader import WiffReader
 from pyx500r.models import Chromatogram, ExperimentInfo, SampleInfo, SpectrumData
@@ -114,6 +116,105 @@ def _compute_isotopic_distribution(
 def _ppm_to_da(mz: float, ppm: float) -> float:
     """Convert ppm tolerance at a given m/z to a ± Da half-window."""
     return mz * ppm * 1e-6
+
+
+def _compact_sci(value: float) -> str:
+    """Return compact scientific notation such as 3e5 for axis labels."""
+    if not np.isfinite(value) or value == 0:
+        return "0"
+    mantissa, exponent = f"{value:.1e}".split("e")
+    mantissa = mantissa.rstrip("0").rstrip(".")
+    return f"{mantissa}e{int(exponent)}"
+
+
+def _style_dense_axes(ax: Any, *, grid: bool = True) -> None:
+    """Use compact margins/ticks suitable for embedded Tk plots."""
+    ax.tick_params(axis="both", which="major", labelsize=8, pad=1)
+    ax.title.set_size(9)
+    if grid:
+        ax.grid(True, axis="both", color="#d0d0d0", linewidth=0.45, alpha=0.8)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.6)
+
+
+def _remove_artists(artists: list[Any]) -> None:
+    for artist in artists:
+        try:
+            artist.remove()
+        except Exception:
+            pass
+
+
+def _label_bbox(ax: Any, x: float, y: float, text: str, fontsize: float, rotation: float) -> Bbox:
+    """Estimate a text label bbox in display pixels for collision checks."""
+    x_px, y_px = ax.transData.transform((x, y))
+    dpi_scale = ax.figure.dpi / 72.0
+    char_w = fontsize * 0.58 * dpi_scale
+    char_h = fontsize * 1.15 * dpi_scale
+    if rotation % 180:
+        width = char_h * 1.4
+        height = max(char_w * len(text), char_h)
+    else:
+        width = max(char_w * len(text), char_h)
+        height = char_h * 1.4
+    return Bbox.from_bounds(x_px - width / 2, y_px, width, height)
+
+
+def _place_peak_labels(
+    ax: Any,
+    mz: np.ndarray,
+    rel: np.ndarray,
+    *,
+    label_for: Any,
+    y_values: np.ndarray | None = None,
+    threshold_pct: float = 2.0,
+    max_labels: int | None = None,
+    color: str = "#333333",
+    fontsize: int = 7,
+    rotation: int = 90,
+) -> list[Any]:
+    """Place peak labels above visible peaks, skipping labels that would overlap."""
+    if mz.size == 0 or rel.size == 0:
+        return []
+    y = rel if y_values is None else y_values
+
+    x_lo, x_hi = ax.get_xlim()
+    y_lo, y_hi = ax.get_ylim()
+    visible = (mz >= x_lo) & (mz <= x_hi) & (rel >= threshold_pct) & (y > max(y_lo, 0))
+    if not visible.any():
+        return []
+
+    candidates = np.flatnonzero(visible)
+    candidates = candidates[np.argsort(rel[candidates])[::-1]]
+    if max_labels is not None:
+        candidates = candidates[:max_labels]
+
+    y_span = max(y_hi - y_lo, 1.0)
+    y_pad = max(y_span * 0.025, 1.0)
+    axes_bbox = ax.bbox.padded(-2)
+    accepted: list[Bbox] = []
+    artists: list[Any] = []
+
+    for idx in candidates:
+        label = label_for(idx)
+        x = float(mz[idx])
+        y_text = min(float(y[idx]) + y_pad, y_hi - y_pad)
+        bbox = _label_bbox(ax, x, y_text, label, fontsize, rotation)
+        if not axes_bbox.contains(bbox.x0, bbox.y0) or not axes_bbox.contains(bbox.x1, bbox.y1):
+            continue
+        padded = bbox.padded(2)
+        if any(padded.overlaps(existing) for existing in accepted):
+            continue
+
+        artist = ax.text(
+            x, y_text, label,
+            ha="center", va="bottom", fontsize=fontsize, rotation=rotation,
+            color=color, clip_on=True,
+        )
+        artists.append(artist)
+        accepted.append(padded)
+
+    return artists
 
 
 class _ExtractionCancelled(Exception):
@@ -291,6 +392,14 @@ class WiffGuiApp(tk.Tk):
         self._current_formula: str = ""
         self._current_adduct: str = "H+"
         self._xic_click_cid: int | None = None  # matplotlib event connection id
+        self._iso_xlim_cid: int | None = None
+        self._iso_ylim_cid: int | None = None
+        self._iso_label_artists: list[Any] = []
+        self._iso_label_data: tuple[np.ndarray, np.ndarray] | None = None
+        self._msms_xlim_cid: int | None = None
+        self._msms_ylim_cid: int | None = None
+        self._msms_label_artists: list[Any] = []
+        self._msms_label_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._extraction_queue: queue.Queue[tuple[str, Any]] | None = None
         self._extraction_thread: threading.Thread | None = None
         self._extraction_cancel_event: threading.Event | None = None
@@ -356,36 +465,9 @@ class WiffGuiApp(tk.Tk):
 
     # ── left panel ────────────────────────────────────────────────────────
     def _build_left_panel(self, parent: ttk.Frame) -> None:
-        # Sample selector
-        sample_frame = ttk.LabelFrame(parent, text="Sample", padding=4)
-        sample_frame.pack(fill=tk.X, padx=2, pady=(2, 4))
-
-        self._sample_var = tk.StringVar(value="(no file)")
-        self._sample_combo = ttk.Combobox(
-            sample_frame, textvariable=self._sample_var, state="readonly",
-        )
-        self._sample_combo.pack(fill=tk.X)
-        self._sample_combo.bind("<<ComboboxSelected>>", self._on_sample_changed)
-
-        # Experiment tree (read-only info)
-        exp_frame = ttk.LabelFrame(parent, text="Experiments", padding=4)
-        exp_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 4))
-
-        self._exp_tree = ttk.Treeview(
-            exp_frame, columns=("cycles", "polarity"),
-            show="tree headings", selectmode="browse", height=6,
-        )
-        self._exp_tree.heading("#0", text="Experiment")
-        self._exp_tree.heading("cycles", text="Cycles")
-        self._exp_tree.heading("polarity", text="Polarity")
-        self._exp_tree.column("#0", width=140, minwidth=80)
-        self._exp_tree.column("cycles", width=50, anchor=tk.CENTER)
-        self._exp_tree.column("polarity", width=60, anchor=tk.CENTER)
-        self._exp_tree.pack(fill=tk.BOTH, expand=True)
-
         # Formula → mass calculator
         formula_frame = ttk.LabelFrame(parent, text="Formula → m/z (optional, needs pyteomics)", padding=4)
-        formula_frame.pack(fill=tk.X, padx=2, pady=(0, 4))
+        formula_frame.pack(fill=tk.X, padx=2, pady=(2, 4))
 
         frow1 = ttk.Frame(formula_frame)
         frow1.pack(fill=tk.X, pady=(0, 2))
@@ -474,10 +556,9 @@ class WiffGuiApp(tk.Tk):
 
         self._xic_fig = Figure(figsize=(6, 3.5), dpi=100)
         self._xic_ax = self._xic_fig.add_subplot(111)
-        self._xic_ax.set_xlabel("Retention Time (min)")
-        self._xic_ax.set_ylabel("Intensity")
         self._xic_ax.set_title("Extracted Ion Chromatogram (TOF-MS)")
-        self._xic_fig.tight_layout()
+        _style_dense_axes(self._xic_ax)
+        self._xic_fig.subplots_adjust(left=0.055, right=0.985, bottom=0.08, top=0.9)
 
         self._xic_canvas = FigureCanvasTkAgg(self._xic_fig, xic_plot_frame)
         self._xic_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -492,12 +573,15 @@ class WiffGuiApp(tk.Tk):
         self._iso_fig = Figure(figsize=(3, 3.5), dpi=100)
         self._iso_ax = self._iso_fig.add_subplot(111)
         self._iso_ax.set_xlabel("m/z")
-        self._iso_ax.set_ylabel("Rel. Abundance (%)")
         self._iso_ax.set_title("Click XIC to view isotope pattern")
-        self._iso_fig.tight_layout()
+        _style_dense_axes(self._iso_ax)
+        self._iso_fig.subplots_adjust(left=0.12, right=0.985, bottom=0.12, top=0.9)
 
         self._iso_canvas = FigureCanvasTkAgg(self._iso_fig, iso_frame)
         self._iso_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self._iso_toolbar = NavigationToolbar2Tk(self._iso_canvas, iso_frame)
+        self._iso_toolbar.update()
 
         # ── MS/MS (bottom) ──
         msms_frame = ttk.Frame(self._right_pane)
@@ -506,9 +590,9 @@ class WiffGuiApp(tk.Tk):
         self._msms_fig = Figure(figsize=(8, 3.5), dpi=100)
         self._msms_ax = self._msms_fig.add_subplot(111)
         self._msms_ax.set_xlabel("m/z")
-        self._msms_ax.set_ylabel("Intensity")
         self._msms_ax.set_title("MS/MS Spectrum (select from left panel)")
-        self._msms_fig.tight_layout()
+        _style_dense_axes(self._msms_ax)
+        self._msms_fig.subplots_adjust(left=0.045, right=0.992, bottom=0.11, top=0.9)
 
         self._msms_canvas = FigureCanvasTkAgg(self._msms_fig, msms_frame)
         self._msms_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -544,8 +628,14 @@ class WiffGuiApp(tk.Tk):
         self._current_path = path
         self._file_label_var.set(path.name)
         self._samples = self._reader.list_samples()
-        self._populate_samples()
-        self._set_status(f"Opened {path.name} — {len(self._samples)} sample(s)")
+        if self._samples:
+            self._current_sample_idx = 0
+            self._experiments = self._reader.get_experiments(self._current_sample_idx)
+            self._extract_btn.config(state=tk.NORMAL if self._experiments else tk.DISABLED)
+        else:
+            self._experiments = []
+            self._extract_btn.config(state=tk.DISABLED)
+        self._set_status(f"Opened {path.name}")
 
     def _close_reader(self) -> None:
         if self._extraction_cancel_event is not None:
@@ -563,9 +653,6 @@ class WiffGuiApp(tk.Tk):
         self._current_msms_spectrum = None
         self._clear_xic_plot()
         self._clear_msms_plot()
-        self._sample_var.set("(no file)")
-        self._sample_combo["values"] = []
-        self._exp_tree.delete(*self._exp_tree.get_children())
         self._msms_tree.delete(*self._msms_tree.get_children())
         self._extract_btn.config(state=tk.DISABLED)
         self._file_label_var.set("No file opened")
@@ -574,41 +661,6 @@ class WiffGuiApp(tk.Tk):
     def _on_close(self) -> None:
         self._close_reader()
         self.destroy()
-
-    # ── sample selection ──────────────────────────────────────────────────
-    def _populate_samples(self) -> None:
-        names = [s.name or f"Sample {s.index}" for s in self._samples]
-        self._sample_combo["values"] = names
-        if names:
-            self._sample_combo.current(0)
-            self._on_sample_changed()
-        else:
-            self._sample_var.set("(no samples)")
-
-    def _on_sample_changed(self, _event: Any = None) -> None:
-        idx = self._sample_combo.current()
-        if idx < 0 or self._reader is None:
-            return
-        self._current_sample_idx = idx
-        self._experiments = self._reader.get_experiments(idx)
-        self._populate_experiments()
-
-        # Enable extract button as soon as a file + sample are available
-        if self._experiments:
-            self._extract_btn.config(state=tk.NORMAL)
-
-    # ── experiment tree (read-only info) ───────────────────────────────────
-    def _populate_experiments(self) -> None:
-        self._exp_tree.delete(*self._exp_tree.get_children())
-        for exp in self._experiments:
-            ms_label = f"MS{exp.ms_level}" if exp.ms_level else "?"
-            display = f"{exp.scan_type or 'Exp ' + str(exp.index)} ({ms_label})"
-            self._exp_tree.insert(
-                "", tk.END,
-                iid=str(exp.index),
-                text=display,
-                values=(str(exp.cycle_count), exp.polarity),
-            )
 
     def _get_ms1_experiment(self) -> ExperimentInfo | None:
         """Return the first TOF-MS (MS1) experiment, or None."""
@@ -747,12 +799,13 @@ class WiffGuiApp(tk.Tk):
             result_queue.put(("error", str(exc)))
 
     def _poll_extraction_queue(self) -> None:
-        if self._extraction_queue is None:
+        active_queue = self._extraction_queue
+        if active_queue is None:
             return
         keep_polling = True
         while True:
             try:
-                kind, payload = self._extraction_queue.get_nowait()
+                kind, payload = active_queue.get_nowait()
             except queue.Empty:
                 break
             if kind == "progress":
@@ -773,7 +826,7 @@ class WiffGuiApp(tk.Tk):
                 messagebox.showerror("Error", f"XIC extraction failed:\n{payload}")
                 keep_polling = False
 
-        if keep_polling:
+        if keep_polling and self._extraction_queue is active_queue:
             self.after(50, self._poll_extraction_queue)
 
     def _handle_extraction_result(self, result: _ExtractionResult) -> None:
@@ -818,19 +871,35 @@ class WiffGuiApp(tk.Tk):
         self._extraction_thread = None
 
     # ── XIC plotting ──────────────────────────────────────────────────────
+    def _format_xic_axis(self, intensities: np.ndarray | None = None) -> None:
+        self._xic_ax.set_xlabel("")
+        self._xic_ax.set_ylabel("")
+        self._xic_ax.xaxis.set_major_locator(MaxNLocator(nbins=9, prune=None))
+        if intensities is not None and intensities.size:
+            y_max = float(np.nanmax(intensities))
+            if y_max > 0:
+                y_top = y_max * 1.04
+                self._xic_ax.set_ylim(0, y_top)
+                self._xic_ax.set_yticks([y_top])
+                self._xic_ax.set_yticklabels([_compact_sci(y_max)])
+            else:
+                self._xic_ax.set_ylim(0, 1)
+                self._xic_ax.set_yticks([1])
+                self._xic_ax.set_yticklabels(["0"])
+        _style_dense_axes(self._xic_ax)
+
     def _plot_xic(self, xic: Chromatogram, target_mz: float, tol_da: float) -> None:
         self._xic_ax.clear()
         t = np.array(xic.times)
         y = np.array(xic.intensities)
         self._xic_ax.plot(t, y, linewidth=0.8, color="#1f77b4", picker=True, pickradius=3)
-        self._xic_ax.set_xlabel("Retention Time (min)")
-        self._xic_ax.set_ylabel("Intensity")
         self._xic_ax.set_title(
             f"XIC: m/z {target_mz:.4f} ± {tol_da:.4f} Da (TOF-MS)"
         )
         self._xic_ax.relim()
         self._xic_ax.autoscale_view()
-        self._xic_fig.tight_layout()
+        self._format_xic_axis(y)
+        self._xic_fig.subplots_adjust(left=0.055, right=0.985, bottom=0.08, top=0.9)
 
         # Connect click handler (disconnect previous if any)
         if self._xic_click_cid is not None:
@@ -843,10 +912,9 @@ class WiffGuiApp(tk.Tk):
 
     def _clear_xic_plot(self) -> None:
         self._xic_ax.clear()
-        self._xic_ax.set_xlabel("Retention Time (min)")
-        self._xic_ax.set_ylabel("Intensity")
         self._xic_ax.set_title("Extracted Ion Chromatogram (TOF-MS)")
-        self._xic_fig.tight_layout()
+        self._format_xic_axis()
+        self._xic_fig.subplots_adjust(left=0.055, right=0.985, bottom=0.08, top=0.9)
         self._xic_canvas.draw_idle()
         self._clear_isotope_plot()
 
@@ -871,7 +939,7 @@ class WiffGuiApp(tk.Tk):
         try:
             spec = self._reader.get_spectrum(
                 self._current_sample_idx, self._current_ms1_idx, cycle,
-                centroid=False, return_arrays=True,
+                centroid=True, return_arrays=True,
             )
         except Exception as exc:
             self._set_status(f"Failed to load spectrum: {exc}")
@@ -883,9 +951,35 @@ class WiffGuiApp(tk.Tk):
             f"{len(spec.mz)} points"
         )
 
+    def _clear_isotope_labels(self) -> None:
+        _remove_artists(self._iso_label_artists)
+        self._iso_label_artists = []
+
+    def _refresh_isotope_labels(self, _ax: Any = None) -> None:
+        if self._iso_label_data is None:
+            return
+        mz, rel = self._iso_label_data
+        if mz.size == 0:
+            return
+
+        self._clear_isotope_labels()
+        self._iso_label_artists = _place_peak_labels(
+            self._iso_ax,
+            mz,
+            rel,
+            label_for=lambda idx: f"{mz[idx]:.4f}",
+            threshold_pct=2.0,
+            max_labels=18,
+            color="#165c26",
+            rotation=90,
+        )
+        self._iso_canvas.draw_idle()
+
     def _plot_isotope(self, spec: SpectrumData, rt: float) -> None:
         """Plot isotope pattern: m/z in [target-0.5, target+2.5], relative abundance."""
         self._iso_ax.clear()
+        self._clear_isotope_labels()
+        self._iso_label_data = None
 
         target = self._current_target_mz
         mz_lo = target - 0.5
@@ -900,8 +994,9 @@ class WiffGuiApp(tk.Tk):
         if len(mz) == 0:
             self._iso_ax.set_title(f"No peaks in [{mz_lo:.2f}, {mz_hi:.2f}]")
             self._iso_ax.set_xlabel("m/z")
-            self._iso_ax.set_ylabel("Rel. Abundance (%)")
-            self._iso_fig.tight_layout()
+            self._iso_ax.set_ylabel("")
+            _style_dense_axes(self._iso_ax)
+            self._iso_fig.subplots_adjust(left=0.12, right=0.985, bottom=0.12, top=0.9)
             self._iso_canvas.draw_idle()
             return
 
@@ -915,11 +1010,14 @@ class WiffGuiApp(tk.Tk):
         self._iso_ax.vlines(mz, 0, rel, color="#2ca02c", linewidth=0.8)
 
         self._iso_ax.set_xlabel("m/z")
-        self._iso_ax.set_ylabel("Rel. Abundance (%)")
+        self._iso_ax.set_ylabel("")
         self._iso_ax.set_title(f"Isotope pattern @ RT={rt:.2f} min")
         self._iso_ax.set_xlim(mz_lo, mz_hi)
         self._iso_ax.set_ylim(0, 105)
-        self._iso_fig.tight_layout()
+        self._iso_ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:.0f}%"))
+        self._iso_ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        _style_dense_axes(self._iso_ax)
+        self._iso_fig.subplots_adjust(left=0.12, right=0.985, bottom=0.12, top=0.9)
 
         # ── Overlay expected isotope distribution from formula ─────────
         if self._current_formula:
@@ -944,14 +1042,27 @@ class WiffGuiApp(tk.Tk):
                         fontsize=7, color="#d62728",
                     )
 
+        self._iso_label_data = (mz, rel)
+        if self._iso_xlim_cid is None:
+            self._iso_xlim_cid = self._iso_ax.callbacks.connect(
+                "xlim_changed", self._refresh_isotope_labels,
+            )
+        if self._iso_ylim_cid is None:
+            self._iso_ylim_cid = self._iso_ax.callbacks.connect(
+                "ylim_changed", self._refresh_isotope_labels,
+            )
+        self._refresh_isotope_labels()
         self._iso_canvas.draw_idle()
 
     def _clear_isotope_plot(self) -> None:
         self._iso_ax.clear()
+        self._clear_isotope_labels()
+        self._iso_label_data = None
         self._iso_ax.set_xlabel("m/z")
-        self._iso_ax.set_ylabel("Rel. Abundance (%)")
+        self._iso_ax.set_ylabel("")
         self._iso_ax.set_title("Select MS/MS to view isotope pattern")
-        self._iso_fig.tight_layout()
+        _style_dense_axes(self._iso_ax)
+        self._iso_fig.subplots_adjust(left=0.12, right=0.985, bottom=0.12, top=0.9)
         self._iso_canvas.draw_idle()
 
     # ── MS/MS matching ────────────────────────────────────────────────────
@@ -1010,15 +1121,42 @@ class WiffGuiApp(tk.Tk):
         try:
             spec = self._reader.get_spectrum(
                 self._current_sample_idx, self._current_ms1_idx, cycle,
-                centroid=False, return_arrays=True,
+                centroid=True, return_arrays=True,
             )
         except Exception:
             return
         self._plot_isotope(spec, self._current_xic.times[idx])
 
     # ── MS/MS plotting ────────────────────────────────────────────────────
+    def _clear_msms_labels(self) -> None:
+        _remove_artists(self._msms_label_artists)
+        self._msms_label_artists = []
+
+    def _refresh_msms_labels(self, _ax: Any = None) -> None:
+        if self._msms_label_data is None:
+            return
+        mz, intensities, rel = self._msms_label_data
+        if mz.size == 0:
+            return
+
+        self._clear_msms_labels()
+        self._msms_label_artists = _place_peak_labels(
+            self._msms_ax,
+            mz,
+            rel,
+            y_values=intensities,
+            label_for=lambda idx: f"[{mz[idx]:.4f}, {rel[idx]:.0f}%]",
+            threshold_pct=2.0,
+            max_labels=10,
+            color="#8c1d1d",
+            rotation=90,
+        )
+        self._msms_canvas.draw_idle()
+
     def _plot_msms(self, spec: SpectrumData) -> None:
         self._msms_ax.clear()
+        self._clear_msms_labels()
+        self._msms_label_data = None
         mz_all = np.asarray(spec.mz)
         intensities_all = np.asarray(spec.intensities)
 
@@ -1033,19 +1171,35 @@ class WiffGuiApp(tk.Tk):
             self._msms_ax.vlines(mz, 0, intensities, color="#d62728", linewidth=0.7)
 
         self._msms_ax.set_xlabel("m/z")
-        self._msms_ax.set_ylabel("Intensity")
+        self._msms_ax.set_ylabel("")
 
         # Fixed x-axis for uniform display: 50 to precursor+10
         x_hi = max(precursor + 10.0, 60.0)
         self._msms_ax.set_xlim(50.0, x_hi)
+        if len(intensities) > 0:
+            y_max = float(np.nanmax(intensities))
+            if y_max > 0:
+                self._msms_ax.set_ylim(0, y_max * 1.18)
+                rel_pct = intensities / y_max * 100.0
+                self._msms_label_data = (mz, intensities, rel_pct)
 
         title = f"MS/MS Spectrum — RT={spec.scan_time:.2f} min"
         if spec.precursor_mz:
             title += f", precursor m/z={spec.precursor_mz:.4f}"
         self._msms_ax.set_title(title)
-        self._msms_ax.relim()
-        self._msms_ax.autoscale_view(scaley=True)
-        self._msms_fig.tight_layout()
+        self._msms_ax.xaxis.set_major_locator(MaxNLocator(nbins=12))
+        self._msms_ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: _compact_sci(v)))
+        _style_dense_axes(self._msms_ax)
+        self._msms_fig.subplots_adjust(left=0.045, right=0.992, bottom=0.11, top=0.9)
+        if self._msms_xlim_cid is None:
+            self._msms_xlim_cid = self._msms_ax.callbacks.connect(
+                "xlim_changed", self._refresh_msms_labels,
+            )
+        if self._msms_ylim_cid is None:
+            self._msms_ylim_cid = self._msms_ax.callbacks.connect(
+                "ylim_changed", self._refresh_msms_labels,
+            )
+        self._refresh_msms_labels()
         self._msms_canvas.draw_idle()
 
     def _fix_pane_sash(self) -> None:
@@ -1059,10 +1213,13 @@ class WiffGuiApp(tk.Tk):
 
     def _clear_msms_plot(self) -> None:
         self._msms_ax.clear()
+        self._clear_msms_labels()
+        self._msms_label_data = None
         self._msms_ax.set_xlabel("m/z")
-        self._msms_ax.set_ylabel("Intensity")
+        self._msms_ax.set_ylabel("")
         self._msms_ax.set_title("MS/MS Spectrum (select from left panel)")
-        self._msms_fig.tight_layout()
+        _style_dense_axes(self._msms_ax)
+        self._msms_fig.subplots_adjust(left=0.045, right=0.992, bottom=0.11, top=0.9)
         self._msms_canvas.draw_idle()
 
     # ── utils ─────────────────────────────────────────────────────────────

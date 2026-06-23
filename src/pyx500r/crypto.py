@@ -26,7 +26,12 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+
+try:  # cryptography >= 46 moved OFB into the decrepit namespace.
+    from cryptography.hazmat.decrepit.ciphers.modes import OFB
+except ImportError:  # pragma: no cover - compatibility with older cryptography
+    from cryptography.hazmat.primitives.ciphers.modes import OFB
 
 __all__ = [
     "WIFF2_PASSWORD",
@@ -74,7 +79,7 @@ def _decrypt_page_core(
     region = page[:page_size - RESERVED_BYTES]
 
     keystream = (
-        Cipher(algorithms.AES(key), modes.OFB(iv))
+        Cipher(algorithms.AES(key), OFB(iv))
         .encryptor()
         .update(b"\x00" * len(region))
     )

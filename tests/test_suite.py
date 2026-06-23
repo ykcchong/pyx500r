@@ -74,7 +74,11 @@ class TestCrypto(unittest.TestCase):
     def test_decrypt_page_1_restores_sqlite_magic(self) -> None:
         """Page 1 must produce the SQLite header magic after decryption."""
         import os
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+        try:
+            from cryptography.hazmat.decrepit.ciphers.modes import OFB
+        except ImportError:  # pragma: no cover - older cryptography
+            from cryptography.hazmat.primitives.ciphers.modes import OFB
 
         key = WIFF2_PASSWORD.encode("utf-8")[:16]
         nonce = os.urandom(12)
@@ -82,7 +86,7 @@ class TestCrypto(unittest.TestCase):
         # Encrypt 4084 zero bytes with OFB
         plain_region = bytes(4084)
         keystream = (
-            Cipher(algorithms.AES(key), modes.OFB(iv))
+            Cipher(algorithms.AES(key), OFB(iv))
             .encryptor()
             .update(b"\x00" * 4084)
         )
@@ -101,7 +105,11 @@ class TestCrypto(unittest.TestCase):
     def test_decrypt_page_round_trip(self) -> None:
         """Encrypt then decrypt should recover original plaintext."""
         import os
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+        try:
+            from cryptography.hazmat.decrepit.ciphers.modes import OFB
+        except ImportError:  # pragma: no cover - older cryptography
+            from cryptography.hazmat.primitives.ciphers.modes import OFB
 
         key = WIFF2_PASSWORD.encode("utf-8")[:16]
         original = os.urandom(4084)
@@ -110,7 +118,7 @@ class TestCrypto(unittest.TestCase):
 
         iv = struct.pack("<I", pageno) + nonce
         keystream = (
-            Cipher(algorithms.AES(key), modes.OFB(iv))
+            Cipher(algorithms.AES(key), OFB(iv))
             .encryptor()
             .update(b"\x00" * 4084)
         )
