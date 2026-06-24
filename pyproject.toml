@@ -78,6 +78,7 @@ pyx500r-index = "pyx500r.index_builder:main"
 pyx500r-libsearch = "pyx500r.libsearch_cli:main"
 pyx500r-search = "pyx500r.w2searcher:main"
 pyx500r-gui = "pyx500r.wiff_gui:main"
+pyx500r-formula = "pyx500r.formula_cli:main"
 
 [project.urls]
 Repository = "https://github.com/ykcchong/pyx500r"

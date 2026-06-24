@@ -57,21 +57,23 @@ except ImportError:
 
 # Known adducts for positive-ion mode
 _ADDUCTS = {
-    "H+":     {"formula": "H+",    "charge": 1},
-    "Na+":    {"formula": "Na+",   "charge": 1},
-    "NH4+":   {"formula": "NH4+",  "charge": 1},
+    "H+":     {"formula": "H+",    "charge": 1, "composition": {"H": 1}},
+    "Na+":    {"formula": "Na+",   "charge": 1, "composition": {"Na": 1}},
+    "NH4+":   {"formula": "NH4+",  "charge": 1, "composition": {"N": 1, "H": 4}},
 }
 
 _DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 _SPECTRA_DIR = _DATA_DIR / "spectra"
 _DEFAULT_CSV_LIBRARY = _SPECTRA_DIR / "highresnps april 2026 shimadzu.csv"
 
+_ELECTRON_MASS = 0.000548579909065
 _PROTON_MASS = 1.007276466621
 _MONOISOTOPIC_MASS = {
     "H": 1.00782503223,
     "C": 12.0,
     "N": 14.00307400443,
     "O": 15.99491461957,
+    "Na": 22.989769282,
     "P": 30.97376199842,
     "S": 31.9720711744,
     "F": 18.99840316273,
@@ -102,20 +104,32 @@ def _resolve_json_library() -> Path:
 
 
 def _calculate_formula_mass(formula: str, adduct: str) -> float | None:
-    """Calculate monoisotopic [M+adduct]+ mass using pyteomics.
+    """Calculate monoisotopic [M+adduct]+ m/z with charged-adduct masses.
 
     Returns None if pyteomics is not installed or the formula is invalid.
     """
     if not _HAS_PYTEOMICS:
         return None
     try:
-        return _pyteomics_mass.calculate_mass(  # type: ignore[union-attr]
-            formula=formula,
-            charge=_ADDUCTS[adduct]["charge"],
-            charge_carrier=_ADDUCTS[adduct]["formula"],
-        )
+        neutral_mass = _pyteomics_mass.calculate_mass(formula=formula)  # type: ignore[union-attr]
+        adduct_info = _ADDUCTS[adduct]
+        charge = int(adduct_info["charge"])
+        adduct_mass = _charged_adduct_mass(adduct)
+        return (neutral_mass + adduct_mass) / abs(charge)
     except Exception:
         return None
+
+
+def _charged_adduct_mass(adduct_key: str) -> float:
+    """Return charged adduct mass, including electron-mass correction."""
+    adduct_info = _ADDUCTS[adduct_key]
+    charge = int(adduct_info["charge"])
+    composition = adduct_info["composition"]
+    neutral_mass = sum(
+        _MONOISOTOPIC_MASS[element] * int(count)
+        for element, count in composition.items()
+    )
+    return neutral_mass - charge * _ELECTRON_MASS
 
 
 def _compute_isotopic_distribution(
@@ -129,16 +143,14 @@ def _compute_isotopic_distribution(
     if not _HAS_PYTEOMICS:
         return []
     try:
-        adduct_info = _ADDUCTS[adduct_key]
-        charge_carrier = adduct_info["formula"]
-        charge = adduct_info["charge"]
+        charge = int(_ADDUCTS[adduct_key]["charge"])
+        adduct_mass = _charged_adduct_mass(adduct_key)
 
         isotopologues = _pyteomics_mass.isotopologues(formula=formula)  # type: ignore[union-attr]
         result: list[tuple[float, float]] = []
         for composition in isotopologues:
-            mz_val = _pyteomics_mass.calculate_mass(  # type: ignore[union-attr]
-                composition=composition, charge=charge, charge_carrier=charge_carrier,
-            )
+            neutral_mass = _pyteomics_mass.calculate_mass(composition=composition)  # type: ignore[union-attr]
+            mz_val = (neutral_mass + adduct_mass) / abs(charge)
             abund = _pyteomics_mass.isotopic_composition_abundance(  # type: ignore[union-attr]
                 formula=formula, composition=composition,
             )
@@ -410,6 +422,7 @@ class _LibraryHit:
 class _FormulaCandidate:
     """One possible fragment formula assignment for a peak."""
     formula: str
+    ion_label: str
     mz: float
     ppm_error: float
     dbe: float | None
@@ -456,6 +469,21 @@ def _format_formula_counts(counts: dict[str, int]) -> str:
         elements.append("H")
     elements.extend(sorted(e for e, n in counts.items() if n > 0 and e not in {"C", "H"}))
     return "".join(f"{element}{counts[element] if counts[element] != 1 else ''}" for element in elements)
+
+
+def _add_formula_counts(base: dict[str, int], added: dict[str, int]) -> dict[str, int]:
+    counts = dict(base)
+    for element, count in added.items():
+        counts[element] = counts.get(element, 0) + count
+    return {element: count for element, count in counts.items() if count > 0}
+
+
+def _same_formula_counts(left: dict[str, int], right: dict[str, int]) -> bool:
+    return {
+        element: count for element, count in left.items() if count > 0
+    } == {
+        element: count for element, count in right.items() if count > 0
+    }
 
 
 def _formula_dbe(counts: dict[str, int]) -> float | None:
@@ -515,8 +543,12 @@ def _fragment_formula_candidates(
                 if dbe is not None and dbe < -0.5:
                     continue
                 formula = _format_formula_counts(counts)
+                if _same_formula_counts(counts, parent_counts):
+                    ion_label = "[M+H]+"
+                else:
+                    ion_label = f"{_format_formula_counts(_add_formula_counts(counts, {'H': 1}))}+"
                 ppm_error = (candidate_mz - observed_mz) / observed_mz * 1e6
-                candidates.append(_FormulaCandidate(formula, candidate_mz, ppm_error, dbe))
+                candidates.append(_FormulaCandidate(formula, ion_label, candidate_mz, ppm_error, dbe))
             return
 
         element = non_h_elements[index]
@@ -568,7 +600,7 @@ def _formula_labels_for_peaks(
         )
         if candidates:
             best = candidates[0]
-            labels[int(idx)] = f"{best.formula} ({best.ppm_error:+.1f} ppm)"
+            labels[int(idx)] = f"{best.ion_label} ({best.ppm_error:+.1f} ppm)"
     return labels
 
 
@@ -826,11 +858,14 @@ class WiffGuiApp(tk.Tk):
         self._iso_ylim_cid: int | None = None
         self._iso_label_artists: list[Any] = []
         self._iso_label_data: tuple[np.ndarray, np.ndarray] | None = None
-        self._msms_xlim_cid: int | None = None
-        self._msms_ylim_cid: int | None = None
-        self._msms_label_artists: list[Any] = []
         self._msms_label_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._msms_formula_labels: dict[int, str] = {}
+        self._msms_plot_data: dict[str, Any] | None = None
+        self._msms_peak_hitboxes: list[dict[str, Any]] = []
+        self._msms_last_tooltip_hit: dict[str, Any] | None = None
+        self._msms_tooltip_bbox: tuple[float, float, float, float] | None = None
+        self._msms_tooltip_text: str = ""
+        self._msms_title_var = tk.StringVar(value="MS/MS Spectrum (select from left panel)")
         self._extraction_queue: queue.Queue[tuple[str, Any]] | None = None
         self._extraction_thread: threading.Thread | None = None
         self._extraction_cancel_event: threading.Event | None = None
@@ -960,13 +995,11 @@ class WiffGuiApp(tk.Tk):
 
         self._msms_tree = ttk.Treeview(
             msms_frame, columns=("time", "precursor", "tic"),
-            show="tree headings", selectmode="browse", height=8,
+            show="headings", selectmode="browse", height=8,
         )
-        self._msms_tree.heading("#0", text="Exp")
         self._msms_tree.heading("time", text="RT (min)")
         self._msms_tree.heading("precursor", text="Precursor m/z")
         self._msms_tree.heading("tic", text="TIC (50→prec)")
-        self._msms_tree.column("#0", width=35, anchor=tk.CENTER)
         self._msms_tree.column("time", width=65, anchor=tk.CENTER)
         self._msms_tree.column("precursor", width=100, anchor=tk.CENTER)
         self._msms_tree.column("tic", width=90, anchor=tk.CENTER)
@@ -979,12 +1012,12 @@ class WiffGuiApp(tk.Tk):
         lib_row = ttk.Frame(lib_frame)
         lib_row.pack(fill=tk.X, pady=(0, 4))
         self._library_btn = ttk.Button(
-            lib_row, text="Search HighResNPS JSON",
+            lib_row, text="LibSearch",
             command=self._search_current_msms_library, state=tk.DISABLED,
         )
         self._library_btn.pack(side=tk.LEFT)
         self._spectrum_text_btn = ttk.Button(
-            lib_row, text="Show MS/MS Text",
+            lib_row, text="MS/MS Text",
             command=self._show_current_msms_text, state=tk.DISABLED,
         )
         self._spectrum_text_btn.pack(side=tk.LEFT, padx=(4, 0))
@@ -1061,18 +1094,20 @@ class WiffGuiApp(tk.Tk):
         msms_frame = ttk.Frame(self._right_pane)
         self._right_pane.add(msms_frame, weight=1)
 
-        self._msms_fig = Figure(figsize=(8, 3.5), dpi=100)
-        self._msms_ax = self._msms_fig.add_subplot(111)
-        self._msms_ax.set_xlabel("m/z")
-        self._msms_ax.set_title("MS/MS Spectrum (select from left panel)")
-        _style_dense_axes(self._msms_ax)
-        self._msms_fig.subplots_adjust(left=0.045, right=0.992, bottom=0.11, top=0.9)
-
-        self._msms_canvas = FigureCanvasTkAgg(self._msms_fig, msms_frame)
-        self._msms_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        self._msms_toolbar = NavigationToolbar2Tk(self._msms_canvas, msms_frame)
-        self._msms_toolbar.update()
+        ttk.Label(msms_frame, textvariable=self._msms_title_var, anchor=tk.W).pack(
+            side=tk.TOP, fill=tk.X, padx=4, pady=(2, 0),
+        )
+        self._msms_canvas = tk.Canvas(
+            msms_frame,
+            background="white",
+            highlightthickness=1,
+            highlightbackground="#c8c8c8",
+        )
+        self._msms_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self._msms_canvas.bind("<Configure>", self._draw_msms_canvas)
+        self._msms_canvas.bind("<Motion>", self._on_msms_canvas_motion)
+        self._msms_canvas.bind("<Button-1>", self._on_msms_canvas_click)
+        self._msms_canvas.bind("<Leave>", self._hide_msms_tooltip)
 
         # Force the sash to split the space evenly (prevents collapsed pane)
         self.update_idletasks()
@@ -1560,7 +1595,6 @@ class WiffGuiApp(tk.Tk):
             tic_str = f"{m.tic_50_parent:.0f}" if m.tic_50_parent > 0 else "0"
             self._msms_tree.insert(
                 "", tk.END, iid=iid,
-                text=str(m.experiment_index),
                 values=(f"{m.scan_time:.2f}", f"{m.precursor_mz:.4f}", tic_str),
             )
 
@@ -1681,13 +1715,13 @@ class WiffGuiApp(tk.Tk):
             mz,
             intensities,
             parent_formula,
-            ppm_tolerance=10.0,
-            top_n_peaks=20,
+            ppm_tolerance=12.0,
+            top_n_peaks=40,
         )
         self._msms_formula_labels = labels
         self._refresh_msms_labels()
         self._set_status(
-            f"Formula annotation: {len(labels)} top-20 peak(s) matched within 10 ppm using {parent_formula}."
+            f"Formula annotation: {len(labels)} top peak(s) matched within 12 ppm using {parent_formula}."
         )
 
     def _search_current_msms_library(self) -> None:
@@ -1832,48 +1866,9 @@ class WiffGuiApp(tk.Tk):
         self._plot_isotope(spec, self._current_xic.times[idx])
 
     # ── MS/MS plotting ────────────────────────────────────────────────────
-    def _clear_msms_labels(self) -> None:
-        _remove_artists(self._msms_label_artists)
-        self._msms_label_artists = []
-
-    def _refresh_msms_labels(self, _ax: Any = None) -> None:
-        if self._msms_label_data is None:
-            return
-        mz, intensities, rel = self._msms_label_data
-        if mz.size == 0:
-            return
-
-        label_rel = rel
-        threshold_pct = 2.0
-        if self._msms_formula_labels:
-            label_rel = np.full(rel.shape, -1.0, dtype=np.float64)
-            for idx in self._msms_formula_labels:
-                if 0 <= idx < label_rel.size:
-                    label_rel[idx] = rel[idx]
-            threshold_pct = 0.0
-
-        self._clear_msms_labels()
-        self._msms_label_artists = _place_peak_labels(
-            self._msms_ax,
-            mz,
-            label_rel,
-            y_values=intensities,
-            label_for=lambda idx: (
-                f"{mz[idx]:.4f}\n{self._msms_formula_labels[int(idx)]}"
-                if int(idx) in self._msms_formula_labels
-                else f"[{mz[idx]:.4f}, {rel[idx]:.0f}%]"
-            ),
-            threshold_pct=threshold_pct,
-            max_labels=20 if self._msms_formula_labels else 10,
-            color="#8c1d1d",
-            rotation=90,
-        )
-        self._msms_canvas.draw_idle()
-
     def _plot_msms(self, spec: SpectrumData, library_hit: _LibraryHit | None = None) -> None:
-        self._msms_ax.clear()
-        self._clear_msms_labels()
         self._msms_label_data = None
+        self._msms_peak_hitboxes = []
         mz_all = np.asarray(spec.mz)
         intensities_all = np.asarray(spec.intensities)
 
@@ -1884,11 +1879,8 @@ class WiffGuiApp(tk.Tk):
         mz = mz_all[mask]
         intensities = intensities_all[mask]
 
-        if len(mz) > 0:
-            self._msms_ax.vlines(mz, 0, intensities, color="#d62728", linewidth=0.7)
-
         lib_mz = np.array([], dtype=np.float64)
-        lib_intensities = np.array([], dtype=np.float64)
+        lib_plot = np.array([], dtype=np.float64)
         if library_hit is not None and library_hit.mz.size and library_hit.intensity.size:
             lib_mask = (library_hit.mz >= 50.0) & (library_hit.mz <= mz_hi_data)
             lib_mz = library_hit.mz[lib_mask]
@@ -1897,24 +1889,14 @@ class WiffGuiApp(tk.Tk):
                 lib_max = float(np.nanmax(lib_intensities))
                 if lib_max > 0:
                     scale_to = float(np.nanmax(intensities)) if len(intensities) else lib_max
-                    lib_plot = -(lib_intensities / lib_max * scale_to)
-                    self._msms_ax.vlines(
-                        lib_mz, 0, lib_plot,
-                        color="#1f77b4", linewidth=0.8, alpha=0.85,
-                    )
-
-        self._msms_ax.set_xlabel("m/z")
-        self._msms_ax.set_ylabel("")
+                    lib_plot = lib_intensities / lib_max * scale_to
 
         # Fixed x-axis for uniform display: 50 to precursor+10
         x_hi = max(precursor + 10.0, 60.0)
-        self._msms_ax.set_xlim(50.0, x_hi)
         y_max = 0.0
         if len(intensities) > 0:
             y_max = float(np.nanmax(intensities))
             if y_max > 0:
-                y_bottom = -y_max * 1.12 if library_hit is not None and lib_intensities.size else 0
-                self._msms_ax.set_ylim(y_bottom, y_max * 1.18)
                 rel_pct = intensities / y_max * 100.0
                 self._msms_label_data = (mz, intensities, rel_pct)
 
@@ -1923,23 +1905,452 @@ class WiffGuiApp(tk.Tk):
             title += f", precursor m/z={spec.precursor_mz:.4f}"
         if library_hit is not None:
             title += f" | library: {library_hit.name[:36]}"
-        self._msms_ax.set_title(title)
-        if library_hit is not None and lib_intensities.size and y_max > 0:
-            self._msms_ax.axhline(0, color="#444444", linewidth=0.6)
-        self._msms_ax.xaxis.set_major_locator(MaxNLocator(nbins=12))
-        self._msms_ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: _compact_sci(abs(v))))
-        _style_dense_axes(self._msms_ax)
-        self._msms_fig.subplots_adjust(left=0.045, right=0.992, bottom=0.11, top=0.9)
-        if self._msms_xlim_cid is None:
-            self._msms_xlim_cid = self._msms_ax.callbacks.connect(
-                "xlim_changed", self._refresh_msms_labels,
+        self._msms_title_var.set(title)
+        self._msms_plot_data = {
+            "mz": mz,
+            "intensities": intensities,
+            "rel_pct": intensities / y_max * 100.0 if y_max > 0 else np.array([], dtype=np.float64),
+            "lib_mz": lib_mz,
+            "lib_intensities": lib_plot,
+            "x_min": 50.0,
+            "x_max": x_hi,
+            "y_max": y_max,
+            "has_library": library_hit is not None and lib_plot.size > 0,
+            "library_hit": library_hit,
+        }
+        self._draw_msms_canvas()
+
+    def _refresh_msms_labels(self, _event: Any = None) -> None:
+        self._draw_msms_canvas()
+
+    def _draw_msms_canvas(self, _event: Any = None) -> None:
+        if not hasattr(self, "_msms_canvas"):
+            return
+        self._hide_msms_tooltip()
+        canvas = self._msms_canvas
+        canvas.delete("all")
+        self._msms_peak_hitboxes = []
+
+        width = max(canvas.winfo_width(), 2)
+        height = max(canvas.winfo_height(), 2)
+        canvas.create_rectangle(0, 0, width, height, fill="white", outline="")
+
+        data = self._msms_plot_data
+        if data is None:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Select an MS/MS spectrum",
+                fill="#666666",
+                font=("TkDefaultFont", 10),
             )
-        if self._msms_ylim_cid is None:
-            self._msms_ylim_cid = self._msms_ax.callbacks.connect(
-                "ylim_changed", self._refresh_msms_labels,
+            return
+
+        left, right, top, bottom = 48, 14, 14, 32
+        plot_w = max(width - left - right, 1)
+        plot_h = max(height - top - bottom, 1)
+        x0, y0 = left, top
+        x1, y1 = left + plot_w, top + plot_h
+
+        x_min = float(data["x_min"])
+        x_max = float(data["x_max"])
+        y_max = float(data["y_max"])
+        y_top = y_max * 1.18 if y_max > 0 else 1.0
+        y_bottom = -y_max * 1.12 if data["has_library"] and y_max > 0 else 0.0
+        y_range = max(y_top - y_bottom, 1.0)
+
+        def x_to_px(x: float) -> float:
+            return x0 + (x - x_min) / max(x_max - x_min, 1e-9) * plot_w
+
+        def y_to_px(y: float) -> float:
+            return y0 + (y_top - y) / y_range * plot_h
+
+        canvas.create_rectangle(x0, y0, x1, y1, outline="#cfcfcf", fill="#fbfbfb")
+
+        for frac in np.linspace(0, 1, 5):
+            y_px = y0 + frac * plot_h
+            canvas.create_line(x0, y_px, x1, y_px, fill="#e5e5e5")
+        for tick in np.linspace(x_min, x_max, 9):
+            x_px = x_to_px(float(tick))
+            canvas.create_line(x_px, y0, x_px, y1, fill="#eeeeee")
+            canvas.create_text(x_px, y1 + 14, text=f"{tick:.0f}", fill="#444444", font=("TkDefaultFont", 8))
+
+        baseline_y = y_to_px(0.0)
+        canvas.create_line(x0, baseline_y, x1, baseline_y, fill="#555555", width=1)
+        canvas.create_line(x0, y0, x0, y1, fill="#888888")
+        canvas.create_text(x0 - 6, y_to_px(y_max), text=_compact_sci(y_max), anchor=tk.E, fill="#444444", font=("TkDefaultFont", 8))
+        canvas.create_text((x0 + x1) / 2, height - 8, text="m/z", fill="#333333", font=("TkDefaultFont", 8))
+
+        lib_mz = np.asarray(data["lib_mz"])
+        lib_intensities = np.asarray(data["lib_intensities"])
+        for mass, intensity in zip(lib_mz, lib_intensities):
+            x_px = x_to_px(float(mass))
+            y_px = y_to_px(-float(intensity))
+            if x0 <= x_px <= x1:
+                canvas.create_line(x_px, baseline_y, x_px, y_px, fill="#1f77b4", width=1)
+
+        mz = np.asarray(data["mz"])
+        intensities = np.asarray(data["intensities"])
+        rel_pct = np.asarray(data["rel_pct"])
+        for idx, (mass, intensity) in enumerate(zip(mz, intensities)):
+            x_px = x_to_px(float(mass))
+            if not (x0 <= x_px <= x1):
+                continue
+            y_px = y_to_px(float(intensity))
+            canvas.create_line(x_px, baseline_y, x_px, y_px, fill="#d62728", width=1)
+            tooltip = [
+                f"m/z {float(mass):.6f}",
+                f"intensity {float(intensity):.6g}",
+            ]
+            if idx < rel_pct.size:
+                tooltip.append(f"relative {float(rel_pct[idx]):.1f}%")
+            if idx in self._msms_formula_labels:
+                tooltip.append(f"formula {self._msms_formula_labels[idx]}")
+            self._msms_peak_hitboxes.append({
+                "index": idx,
+                "mz": float(mass),
+                "intensity": float(intensity),
+                "relative_pct": float(rel_pct[idx]) if idx < rel_pct.size else None,
+                "formula_label": self._msms_formula_labels.get(idx),
+                "x": x_px,
+                "y_top": y_px,
+                "y_base": baseline_y,
+                "text": "\n".join(tooltip),
+            })
+
+        if self._msms_formula_labels:
+            self._draw_msms_formula_labels(canvas, mz, intensities, rel_pct, x_to_px, y_to_px, x0, y0, x1, y1)
+
+    def _draw_msms_formula_labels(
+        self,
+        canvas: tk.Canvas,
+        mz: np.ndarray,
+        intensities: np.ndarray,
+        rel_pct: np.ndarray,
+        x_to_px: Callable[[float], float],
+        y_to_px: Callable[[float], float],
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+    ) -> None:
+        placed: list[tuple[float, float, float, float]] = []
+        leaders: list[tuple[tuple[float, float], tuple[float, float]]] = []
+
+        def _segments_intersect(
+            a: tuple[float, float],
+            b: tuple[float, float],
+            c: tuple[float, float],
+            d: tuple[float, float],
+        ) -> bool:
+            def _orient(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> float:
+                return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+            return _orient(a, c, d) * _orient(b, c, d) < 0 and _orient(a, b, c) * _orient(a, b, d) < 0
+
+        primary = [
+            idx for idx in sorted(
+                self._msms_formula_labels,
+                key=lambda i: (
+                    np.sqrt(max(float(intensities[i]), 0.0)) * float(mz[i])
+                    if i < intensities.size and i < mz.size
+                    else 0.0
+                ),
+                reverse=True,
             )
-        self._refresh_msms_labels()
-        self._msms_canvas.draw_idle()
+            if idx < intensities.size and idx < mz.size and intensities[idx] > 0
+        ][:10]
+        primary_set = set(primary)
+        secondary = [
+            idx for idx in sorted(
+                self._msms_formula_labels,
+                key=lambda i: rel_pct[i] if i < rel_pct.size else 0.0,
+                reverse=True,
+            )
+            if (
+                idx not in primary_set
+                and idx < intensities.size
+                and idx < mz.size
+                and idx < rel_pct.size
+                and rel_pct[idx] >= 5.0
+            )
+        ][:3]
+        label_order = primary + secondary
+
+        for idx in label_order:
+            if idx >= mz.size or idx >= intensities.size:
+                continue
+            greedy_local = idx not in primary_set
+            x_px = x_to_px(float(mz[idx]))
+            peak_y = y_to_px(float(intensities[idx]))
+            label = f"{mz[idx]:.4f}\n{self._msms_formula_labels[idx]}"
+            text_w = max(54.0, len(max(label.splitlines(), key=len)) * 5.4 + 10)
+            text_h = 30.0
+            candidate_centers: list[tuple[float, float, float]] = []
+
+            row_ys: list[float] = []
+            for row_y in [peak_y - 34, peak_y - 62, peak_y - 90, peak_y - 118]:
+                if y0 + text_h / 2 <= row_y <= y1 - text_h / 2:
+                    row_ys.append(row_y)
+            if not greedy_local:
+                row_step = text_h + 8
+                for row in range(8):
+                    row_y = y0 + text_h / 2 + 8 + row * row_step
+                    if y0 + text_h / 2 <= row_y <= y1 - text_h / 2:
+                        row_ys.append(row_y)
+
+            x_positions: list[float] = []
+            x_multipliers = [0.0, -0.75, 0.75] if greedy_local else [0.0, -0.75, 0.75, -1.5, 1.5, -2.4, 2.4, -3.2, 3.2]
+            for x_mult in x_multipliers:
+                x_positions.append(x_px + x_mult * text_w)
+            plot_w = max(x1 - x0, 1.0)
+            if not greedy_local:
+                for frac in [0.35, 0.45, 0.55, 0.65, 0.75, 0.84, 0.92]:
+                    lane_x = x0 + plot_w * frac
+                    if abs(lane_x - x_px) < text_w * 3.0:
+                        x_positions.append(lane_x)
+
+            for cy in row_ys:
+                for cx in x_positions:
+                    cost = abs(cx - x_px) * 0.18
+                    cost += max(peak_y - cy, 0.0) * 0.10
+                    cost += max(cy - peak_y, 0.0) * 0.90
+                    if cy < peak_y - 80:
+                        cost -= 18.0
+                    candidate_centers.append((cx, cy, cost))
+
+            if not greedy_local:
+                for existing in placed:
+                    ex0, ey0, ex1, _ey1 = existing
+                    cx = (ex0 + ex1) / 2
+                    if abs(cx - x_px) >= text_w * 2.1:
+                        continue
+                    for level in [1, 2, 3]:
+                        cy = ey0 - level * (text_h + 8) + text_h / 2
+                        if y0 + text_h / 2 <= cy <= y1 - text_h / 2:
+                            candidate_centers.append((cx, cy, 20.0 + abs(cx - x_px) * 0.10 + level * 8.0))
+
+            candidate_centers.sort(key=lambda item: item[2])
+
+            best: tuple[float, float, float, float] | None = None
+            best_cost = float("inf")
+            best_leader: tuple[tuple[float, float], tuple[float, float]] | None = None
+
+            def _peak_obstruction_cost(box: tuple[float, float, float, float]) -> float:
+                bx0, by0, bx1, by1 = box
+                cost = 0.0
+                for other_idx, (other_mz, other_intensity) in enumerate(zip(mz, intensities)):
+                    if other_idx == idx:
+                        continue
+                    other_x = x_to_px(float(other_mz))
+                    if not (bx0 <= other_x <= bx1):
+                        continue
+                    other_peak_y = y_to_px(float(other_intensity))
+                    if other_peak_y <= by1 and y1 >= by0:
+                        rel = float(rel_pct[other_idx]) if other_idx < rel_pct.size else 0.0
+                        cost += 80.0 + np.sqrt(max(rel, 0.0)) * (45.0 if greedy_local else 35.0)
+                return cost
+
+            for cx, cy, cost in candidate_centers:
+                box = (
+                    cx - text_w / 2,
+                    cy - text_h / 2,
+                    cx + text_w / 2,
+                    cy + text_h / 2,
+                )
+                if box[0] < x0 or box[2] > x1 or box[1] < y0 or box[3] > y1:
+                    continue
+                padded = (box[0] - 3, box[1] - 3, box[2] + 3, box[3] + 3)
+                if any(
+                    not (
+                        padded[2] < existing[0]
+                        or padded[0] > existing[2]
+                        or padded[3] < existing[1]
+                        or padded[1] > existing[3]
+                    )
+                    for existing in placed
+                ):
+                    continue
+
+                anchor_x = min(max(x_px, box[0] + 6), box[2] - 6)
+                anchor_y = box[3] if cy < peak_y else box[1]
+                leader = ((x_px, peak_y), (anchor_x, anchor_y))
+                crossing_cost = sum(
+                    180.0
+                    for existing_leader in leaders
+                    if _segments_intersect(leader[0], leader[1], existing_leader[0], existing_leader[1])
+                )
+                line_box_cost = 0.0
+                for existing in placed:
+                    ex0, ey0, ex1, ey1 = existing
+                    edges = [
+                        ((ex0, ey0), (ex1, ey0)),
+                        ((ex1, ey0), (ex1, ey1)),
+                        ((ex1, ey1), (ex0, ey1)),
+                        ((ex0, ey1), (ex0, ey0)),
+                    ]
+                    if any(_segments_intersect(leader[0], leader[1], edge[0], edge[1]) for edge in edges):
+                        line_box_cost += 220.0
+
+                total_cost = cost + _peak_obstruction_cost(box) + crossing_cost + line_box_cost
+                if total_cost < best_cost:
+                    best = box
+                    best_cost = total_cost
+                    best_leader = leader
+
+            if best is None or best_leader is None:
+                continue
+
+            placed.append(best)
+            leaders.append(best_leader)
+            bx0, by0, bx1, by1 = best
+            label_x = (bx0 + bx1) / 2
+            label_y = (by0 + by1) / 2
+            canvas.create_line(
+                best_leader[0][0],
+                best_leader[0][1],
+                best_leader[1][0],
+                best_leader[1][1],
+                fill="#8c1d1d",
+                width=1,
+                dash=(2, 2),
+            )
+            canvas.create_rectangle(
+                bx0,
+                by0,
+                bx1,
+                by1,
+                fill="#fffafa",
+                outline="#cc8a8a",
+                width=1,
+            )
+            canvas.create_text(
+                label_x,
+                label_y,
+                text=label,
+                fill="#8c1d1d",
+                font=("TkDefaultFont", 8),
+                justify=tk.CENTER,
+            )
+
+    def _on_msms_canvas_motion(self, event: tk.Event) -> None:
+        if self._msms_tooltip_bbox is not None:
+            x0, y0, x1, y1 = self._msms_tooltip_bbox
+            if x0 <= float(event.x) <= x1 and y0 <= float(event.y) <= y1:
+                return
+
+        nearest: dict[str, Any] | None = None
+        best_dist = 9999.0
+        for hit in self._msms_peak_hitboxes:
+            dx = abs(float(event.x) - float(hit["x"]))
+            if dx > 5:
+                continue
+            y_top = min(float(hit["y_top"]), float(hit["y_base"]))
+            y_base = max(float(hit["y_top"]), float(hit["y_base"]))
+            if not (y_top - 8 <= float(event.y) <= y_base + 8):
+                continue
+            if dx < best_dist:
+                best_dist = dx
+                nearest = hit
+        if nearest is None:
+            self._hide_msms_tooltip()
+            return
+        self._msms_last_tooltip_hit = dict(nearest)
+        self._show_msms_tooltip(str(nearest.get("text", "")).strip(), event.x + 12, event.y + 12)
+
+    def _show_msms_tooltip(self, text: str, x: int, y: int) -> None:
+        if not text:
+            self._hide_msms_tooltip()
+            return
+
+        canvas = self._msms_canvas
+        canvas.delete("hover_tooltip")
+        lines = text.splitlines()
+        text_w = max(80, max(len(line) for line in lines) * 6 + 14)
+        text_h = max(24, len(lines) * 15 + 10)
+        canvas_w = max(canvas.winfo_width(), 1)
+        canvas_h = max(canvas.winfo_height(), 1)
+        x0 = min(max(float(x), 2.0), max(canvas_w - text_w - 2.0, 2.0))
+        y0 = min(max(float(y), 2.0), max(canvas_h - text_h - 2.0, 2.0))
+        x1 = x0 + text_w
+        y1 = y0 + text_h
+
+        canvas.create_rectangle(
+            x0 + 4,
+            y0 + 4,
+            x1 + 4,
+            y1 + 4,
+            fill="#cfcfcf",
+            outline="",
+            stipple="gray50",
+            tags=("hover_tooltip",),
+        )
+        canvas.create_rectangle(
+            x0,
+            y0,
+            x1,
+            y1,
+            fill="#ffffe8",
+            outline="#777777",
+            width=1,
+            tags=("hover_tooltip",),
+        )
+        canvas.create_text(
+            x0 + 7,
+            y0 + 5,
+            text=text,
+            fill="#222222",
+            anchor=tk.NW,
+            justify=tk.LEFT,
+            font=("TkDefaultFont", 9),
+            tags=("hover_tooltip",),
+        )
+        canvas.tag_raise("hover_tooltip")
+        self._msms_tooltip_bbox = (x0, y0, x1, y1)
+        self._msms_tooltip_text = text
+
+    def _show_msms_tooltip_debug(self, _event: Any = None) -> None:
+        hit = self._msms_last_tooltip_hit
+        if not hit:
+            messagebox.showinfo("MS/MS hover debug", "No stored hover hitbox.")
+            return
+
+        tooltip = str(hit.get("text", ""))
+        lines = [
+            "Stored MS/MS hover hitbox",
+            "",
+            f"index: {hit.get('index')}",
+            f"m/z: {hit.get('mz')}",
+            f"intensity: {hit.get('intensity')}",
+            f"relative_pct: {hit.get('relative_pct')}",
+            f"formula_label: {hit.get('formula_label')!r}",
+            "",
+            f"canvas x: {hit.get('x')}",
+            f"canvas y_top: {hit.get('y_top')}",
+            f"canvas y_base: {hit.get('y_base')}",
+            "",
+            f"tooltip repr: {tooltip!r}",
+        ]
+        if self._msms_tooltip_bbox is not None:
+            lines.extend([
+                "",
+                f"canvas tooltip bbox: {self._msms_tooltip_bbox}",
+                f"canvas tooltip text repr: {self._msms_tooltip_text!r}",
+            ])
+        messagebox.showinfo("MS/MS hover debug", "\n".join(lines))
+
+    def _hide_msms_tooltip(self, _event: Any = None) -> None:
+        if hasattr(self, "_msms_canvas"):
+            self._msms_canvas.delete("hover_tooltip")
+        self._msms_tooltip_bbox = None
+        self._msms_tooltip_text = ""
+
+    def _on_msms_canvas_click(self, event: tk.Event) -> None:
+        if self._msms_tooltip_bbox is None:
+            return
+        x0, y0, x1, y1 = self._msms_tooltip_bbox
+        if x0 <= float(event.x) <= x1 and y0 <= float(event.y) <= y1:
+            self._show_msms_tooltip_debug(event)
 
     def _fix_pane_sash(self) -> None:
         """Ensure the vertical PanedWindow sash splits space evenly."""
@@ -1951,16 +2362,14 @@ class WiffGuiApp(tk.Tk):
             pass
 
     def _clear_msms_plot(self) -> None:
-        self._msms_ax.clear()
-        self._clear_msms_labels()
         self._msms_label_data = None
         self._msms_formula_labels = {}
-        self._msms_ax.set_xlabel("m/z")
-        self._msms_ax.set_ylabel("")
-        self._msms_ax.set_title("MS/MS Spectrum (select from left panel)")
-        _style_dense_axes(self._msms_ax)
-        self._msms_fig.subplots_adjust(left=0.045, right=0.992, bottom=0.11, top=0.9)
-        self._msms_canvas.draw_idle()
+        self._msms_plot_data = None
+        self._msms_peak_hitboxes = []
+        self._msms_last_tooltip_hit = None
+        self._hide_msms_tooltip()
+        self._msms_title_var.set("MS/MS Spectrum (select from left panel)")
+        self._draw_msms_canvas()
 
     # ── utils ─────────────────────────────────────────────────────────────
     def _set_status(self, text: str) -> None:
