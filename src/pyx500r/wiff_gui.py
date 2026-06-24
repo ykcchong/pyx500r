@@ -24,6 +24,7 @@ from __future__ import annotations
 import csv
 import json
 import queue
+import re
 import threading
 import tkinter as tk
 from collections.abc import Callable
@@ -42,6 +43,7 @@ from matplotlib.figure import Figure
 from matplotlib.transforms import Bbox
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
+from pyx500r.centroid import centroid_spectrum
 from pyx500r.reader import WiffReader
 from pyx500r.models import Chromatogram, ExperimentInfo, SampleInfo, SpectrumData
 
@@ -63,6 +65,24 @@ _ADDUCTS = {
 _DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 _SPECTRA_DIR = _DATA_DIR / "spectra"
 _DEFAULT_CSV_LIBRARY = _SPECTRA_DIR / "highresnps april 2026 shimadzu.csv"
+
+_PROTON_MASS = 1.007276466621
+_MONOISOTOPIC_MASS = {
+    "H": 1.00782503223,
+    "C": 12.0,
+    "N": 14.00307400443,
+    "O": 15.99491461957,
+    "P": 30.97376199842,
+    "S": 31.9720711744,
+    "F": 18.99840316273,
+    "Cl": 34.968852682,
+    "Br": 78.9183376,
+    "I": 126.9044719,
+    "B": 11.00930536,
+    "Si": 27.97692653465,
+}
+_HALOGENS = {"F", "Cl", "Br", "I"}
+_FORMULA_RE = re.compile(r"([A-Z][a-z]?)(\d*)")
 
 
 def _resolve_json_library() -> Path:
@@ -386,6 +406,15 @@ class _LibraryHit:
     intensity: np.ndarray
 
 
+@dataclass(frozen=True)
+class _FormulaCandidate:
+    """One possible fragment formula assignment for a peak."""
+    formula: str
+    mz: float
+    ppm_error: float
+    dbe: float | None
+
+
 def _float_or_none(value: str | None) -> float | None:
     if value is None or value == "":
         return None
@@ -393,6 +422,177 @@ def _float_or_none(value: str | None) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def _parse_formula_counts(formula: str) -> dict[str, int] | None:
+    """Parse a simple chemical formula such as C17H21NO4 into element counts."""
+    formula = formula.strip()
+    if not formula:
+        return None
+    counts: dict[str, int] = {}
+    pos = 0
+    for match in _FORMULA_RE.finditer(formula):
+        if match.start() != pos:
+            return None
+        element, count_text = match.groups()
+        if element not in _MONOISOTOPIC_MASS:
+            return None
+        count = int(count_text) if count_text else 1
+        if count <= 0:
+            return None
+        counts[element] = counts.get(element, 0) + count
+        pos = match.end()
+    if pos != len(formula) or not counts:
+        return None
+    return counts
+
+
+def _format_formula_counts(counts: dict[str, int]) -> str:
+    """Return a compact Hill-style formula string."""
+    elements: list[str] = []
+    if counts.get("C", 0) > 0:
+        elements.append("C")
+    if counts.get("H", 0) > 0:
+        elements.append("H")
+    elements.extend(sorted(e for e, n in counts.items() if n > 0 and e not in {"C", "H"}))
+    return "".join(f"{element}{counts[element] if counts[element] != 1 else ''}" for element in elements)
+
+
+def _formula_dbe(counts: dict[str, int]) -> float | None:
+    """Return double-bond equivalent for CHN-halogen formulas."""
+    carbon = counts.get("C", 0)
+    if carbon == 0:
+        return None
+    hydrogen = counts.get("H", 0)
+    nitrogen = counts.get("N", 0)
+    halogens = sum(counts.get(element, 0) for element in _HALOGENS)
+    return carbon - (hydrogen + halogens) / 2.0 + nitrogen / 2.0 + 1.0
+
+
+def _dbe_penalty(dbe: float | None) -> float:
+    if dbe is None:
+        return 0.5
+    if dbe < -0.5:
+        return 20.0 + abs(dbe)
+    nearest_half = round(dbe * 2.0) / 2.0
+    return abs(dbe - nearest_half) * 2.0
+
+
+def _fragment_formula_candidates(
+    parent_counts: dict[str, int],
+    observed_mz: float,
+    *,
+    ppm_tolerance: float = 10.0,
+    top_n: int = 3,
+) -> list[_FormulaCandidate]:
+    """Find plausible [fragment+H]+ formulas constrained by the parent formula."""
+    if observed_mz <= _PROTON_MASS:
+        return []
+
+    neutral_target = observed_mz - _PROTON_MASS
+    abs_tol = observed_mz * ppm_tolerance * 1e-6
+    h_max = parent_counts.get("H", 0)
+    non_h_elements = sorted(e for e in parent_counts if e != "H")
+    candidates: list[_FormulaCandidate] = []
+
+    def _walk(index: int, partial: dict[str, int], mass_without_h: float) -> None:
+        if mass_without_h - abs_tol > neutral_target:
+            return
+        if index == len(non_h_elements):
+            remaining = neutral_target - mass_without_h
+            h_estimate = int(round(remaining / _MONOISOTOPIC_MASS["H"])) if h_max else 0
+            for h_count in range(max(0, h_estimate - 2), min(h_max, h_estimate + 2) + 1):
+                counts = {element: count for element, count in partial.items() if count > 0}
+                if h_count:
+                    counts["H"] = h_count
+                if not counts:
+                    continue
+                neutral_mass = mass_without_h + h_count * _MONOISOTOPIC_MASS["H"]
+                candidate_mz = neutral_mass + _PROTON_MASS
+                if abs(candidate_mz - observed_mz) > abs_tol:
+                    continue
+                dbe = _formula_dbe(counts)
+                if dbe is not None and dbe < -0.5:
+                    continue
+                formula = _format_formula_counts(counts)
+                ppm_error = (candidate_mz - observed_mz) / observed_mz * 1e6
+                candidates.append(_FormulaCandidate(formula, candidate_mz, ppm_error, dbe))
+            return
+
+        element = non_h_elements[index]
+        element_mass = _MONOISOTOPIC_MASS[element]
+        for count in range(parent_counts[element] + 1):
+            if count:
+                partial[element] = count
+            else:
+                partial.pop(element, None)
+            _walk(index + 1, partial, mass_without_h + count * element_mass)
+        partial.pop(element, None)
+
+    _walk(0, {}, 0.0)
+    candidates.sort(key=lambda c: (abs(c.ppm_error) + _dbe_penalty(c.dbe), abs(c.ppm_error), c.formula))
+    return candidates[:top_n]
+
+
+def _top_peak_indices(mz: np.ndarray, intensities: np.ndarray, *, top_n: int = 20) -> np.ndarray:
+    count = min(mz.size, intensities.size)
+    if count == 0:
+        return np.array([], dtype=np.int64)
+    finite = np.isfinite(mz[:count]) & np.isfinite(intensities[:count])
+    valid = np.flatnonzero(finite)
+    if valid.size == 0:
+        return valid
+    top = valid[np.argsort(intensities[valid])[::-1][:top_n]]
+    return top[np.argsort(mz[top])]
+
+
+def _formula_labels_for_peaks(
+    mz: np.ndarray,
+    intensities: np.ndarray,
+    parent_formula: str,
+    *,
+    ppm_tolerance: float = 10.0,
+    top_n_peaks: int = 20,
+) -> dict[int, str]:
+    parent_counts = _parse_formula_counts(parent_formula)
+    if parent_counts is None:
+        return {}
+
+    labels: dict[int, str] = {}
+    for idx in _top_peak_indices(mz, intensities, top_n=top_n_peaks):
+        candidates = _fragment_formula_candidates(
+            parent_counts,
+            float(mz[idx]),
+            ppm_tolerance=ppm_tolerance,
+            top_n=1,
+        )
+        if candidates:
+            best = candidates[0]
+            labels[int(idx)] = f"{best.formula} ({best.ppm_error:+.1f} ppm)"
+    return labels
+
+
+def _format_msms_peak_text(spec: SpectrumData) -> str:
+    """Format the top 20 MS/MS peaks as two space-separated columns."""
+    mz = np.asarray(spec.mz, dtype=np.float64)
+    intensities = np.asarray(spec.intensities, dtype=np.float64)
+    if not spec.centroided:
+        mz, intensities = centroid_spectrum(mz, intensities, return_arrays=True)
+    if mz.size == 0 or intensities.size == 0:
+        return ""
+
+    count = min(mz.size, intensities.size)
+    finite = np.isfinite(mz[:count]) & np.isfinite(intensities[:count])
+    mz = mz[:count][finite]
+    intensities = intensities[:count][finite]
+    if mz.size == 0:
+        return ""
+
+    top = _top_peak_indices(mz, intensities, top_n=20)
+    return "\n".join(
+        f"{mass:.6f} {intensity:.6g}"
+        for mass, intensity in zip(mz[top], intensities[top])
+    )
 
 
 def _csv_row_to_matchms_json(row: dict[str, str]) -> dict[str, Any] | None:
@@ -630,6 +830,7 @@ class WiffGuiApp(tk.Tk):
         self._msms_ylim_cid: int | None = None
         self._msms_label_artists: list[Any] = []
         self._msms_label_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._msms_formula_labels: dict[int, str] = {}
         self._extraction_queue: queue.Queue[tuple[str, Any]] | None = None
         self._extraction_thread: threading.Thread | None = None
         self._extraction_cancel_event: threading.Event | None = None
@@ -782,6 +983,16 @@ class WiffGuiApp(tk.Tk):
             command=self._search_current_msms_library, state=tk.DISABLED,
         )
         self._library_btn.pack(side=tk.LEFT)
+        self._spectrum_text_btn = ttk.Button(
+            lib_row, text="Show MS/MS Text",
+            command=self._show_current_msms_text, state=tk.DISABLED,
+        )
+        self._spectrum_text_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self._formula_annotate_btn = ttk.Button(
+            lib_row, text="Annotate Formulas",
+            command=self._annotate_current_msms_formulas, state=tk.DISABLED,
+        )
+        self._formula_annotate_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self._library_tree = ttk.Treeview(
             lib_frame, columns=("score", "matches", "precursor", "formula"),
@@ -921,6 +1132,8 @@ class WiffGuiApp(tk.Tk):
         self._library_hits_by_iid = {}
         self._current_library_hit = None
         self._library_btn.config(state=tk.DISABLED)
+        self._spectrum_text_btn.config(state=tk.DISABLED)
+        self._formula_annotate_btn.config(state=tk.DISABLED)
         self._extract_btn.config(state=tk.DISABLED)
         self._file_label_var.set("No file opened")
         self._current_formula = ""
@@ -1335,6 +1548,13 @@ class WiffGuiApp(tk.Tk):
     # ── MS/MS matching ────────────────────────────────────────────────────
     def _populate_msms_matches(self, matches: list[_MsMsMatch]) -> None:
         self._msms_tree.delete(*self._msms_tree.get_children())
+        self._current_msms_spectrum = None
+        self._current_library_hit = None
+        self._library_tree.delete(*self._library_tree.get_children())
+        self._library_hits_by_iid = {}
+        self._library_btn.config(state=tk.DISABLED)
+        self._spectrum_text_btn.config(state=tk.DISABLED)
+        self._formula_annotate_btn.config(state=tk.DISABLED)
         for m in matches:
             iid = f"{m.experiment_index}:{m.cycle_index}"
             tic_str = f"{m.tic_50_parent:.0f}" if m.tic_50_parent > 0 else "0"
@@ -1364,10 +1584,13 @@ class WiffGuiApp(tk.Tk):
 
         self._current_msms_spectrum = spec
         self._current_library_hit = None
+        self._msms_formula_labels = {}
         self._plot_msms(spec)
         self._library_tree.delete(*self._library_tree.get_children())
         self._library_hits_by_iid = {}
         self._library_btn.config(state=tk.NORMAL)
+        self._spectrum_text_btn.config(state=tk.NORMAL)
+        self._formula_annotate_btn.config(state=tk.NORMAL)
 
         # ── Auto-show isotope pattern from MS1 at this RT ────────────
         if self._current_target_mz > 0:
@@ -1377,6 +1600,94 @@ class WiffGuiApp(tk.Tk):
             f"MS/MS: exp={exp_idx}, cycle={cycle}, "
             f"RT={spec.scan_time:.2f} min, "
             f"precursor={spec.precursor_mz or '?'}, {len(spec.mz)} points"
+        )
+
+    def _show_current_msms_text(self) -> None:
+        if self._current_msms_spectrum is None:
+            messagebox.showinfo("No MS/MS selected", "Select a matching MS/MS spectrum first.")
+            return
+
+        spec = self._current_msms_spectrum
+        peak_text = _format_msms_peak_text(spec)
+        if not peak_text:
+            messagebox.showinfo("No peaks", "The selected MS/MS spectrum has no peaks to display.")
+            return
+
+        title = (
+            f"Centroided MS/MS Text - RT {spec.scan_time:.2f} min"
+            + (f", precursor {spec.precursor_mz:.4f}" if spec.precursor_mz else "")
+        )
+        window = tk.Toplevel(self)
+        window.title(title)
+        window.geometry("520x420")
+        window.minsize(360, 240)
+
+        body = ttk.Frame(window, padding=6)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        text_frame = ttk.Frame(body)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        text = tk.Text(text_frame, wrap=tk.NONE, font=("Courier New", 10), undo=False)
+        y_scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text.yview)
+        x_scroll = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=text.xview)
+        text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        text.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+
+        text.insert("1.0", peak_text)
+        text.mark_set(tk.INSERT, "1.0")
+        text.focus_set()
+
+        button_row = ttk.Frame(body)
+        button_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(
+            button_row,
+            text="Copy",
+            command=lambda: self._copy_msms_text(peak_text),
+        ).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Close", command=window.destroy).pack(side=tk.RIGHT)
+
+    def _copy_msms_text(self, peak_text: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(peak_text)
+        self._set_status("Copied centroided MS/MS peak list to clipboard.")
+
+    def _annotate_current_msms_formulas(self) -> None:
+        if self._current_msms_spectrum is None or self._msms_label_data is None:
+            messagebox.showinfo("No MS/MS selected", "Select a matching MS/MS spectrum first.")
+            return
+
+        parent_formula = self._formula_var.get().strip() or self._current_formula
+        if not parent_formula:
+            messagebox.showinfo(
+                "No parent formula",
+                "Enter a parent formula in the Formula box before annotating fragments.",
+            )
+            return
+        if _parse_formula_counts(parent_formula) is None:
+            messagebox.showwarning(
+                "Invalid formula",
+                f"Could not parse '{parent_formula}'. Use a simple formula such as C17H21NO4.",
+            )
+            return
+
+        mz, intensities, _rel = self._msms_label_data
+        labels = _formula_labels_for_peaks(
+            mz,
+            intensities,
+            parent_formula,
+            ppm_tolerance=10.0,
+            top_n_peaks=20,
+        )
+        self._msms_formula_labels = labels
+        self._refresh_msms_labels()
+        self._set_status(
+            f"Formula annotation: {len(labels)} top-20 peak(s) matched within 10 ppm using {parent_formula}."
         )
 
     def _search_current_msms_library(self) -> None:
@@ -1494,6 +1805,7 @@ class WiffGuiApp(tk.Tk):
         if hit is None:
             return
         self._current_library_hit = hit
+        self._msms_formula_labels = {}
         self._plot_msms(self._current_msms_spectrum, library_hit=hit)
         self._set_status(
             f"Library comparison: {hit.name} "
@@ -1531,15 +1843,28 @@ class WiffGuiApp(tk.Tk):
         if mz.size == 0:
             return
 
+        label_rel = rel
+        threshold_pct = 2.0
+        if self._msms_formula_labels:
+            label_rel = np.full(rel.shape, -1.0, dtype=np.float64)
+            for idx in self._msms_formula_labels:
+                if 0 <= idx < label_rel.size:
+                    label_rel[idx] = rel[idx]
+            threshold_pct = 0.0
+
         self._clear_msms_labels()
         self._msms_label_artists = _place_peak_labels(
             self._msms_ax,
             mz,
-            rel,
+            label_rel,
             y_values=intensities,
-            label_for=lambda idx: f"[{mz[idx]:.4f}, {rel[idx]:.0f}%]",
-            threshold_pct=2.0,
-            max_labels=10,
+            label_for=lambda idx: (
+                f"{mz[idx]:.4f}\n{self._msms_formula_labels[int(idx)]}"
+                if int(idx) in self._msms_formula_labels
+                else f"[{mz[idx]:.4f}, {rel[idx]:.0f}%]"
+            ),
+            threshold_pct=threshold_pct,
+            max_labels=20 if self._msms_formula_labels else 10,
             color="#8c1d1d",
             rotation=90,
         )
@@ -1629,6 +1954,7 @@ class WiffGuiApp(tk.Tk):
         self._msms_ax.clear()
         self._clear_msms_labels()
         self._msms_label_data = None
+        self._msms_formula_labels = {}
         self._msms_ax.set_xlabel("m/z")
         self._msms_ax.set_ylabel("")
         self._msms_ax.set_title("MS/MS Spectrum (select from left panel)")
